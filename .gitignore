@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+# Test outputs (regenerated from source)
+*_test/
+test_*/
+extracted_frames/
+
+# Node.js
+node_modules/
+npm-debug.log*
+
+# Build outputs (can be regenerated)
+web/dist/
+
+# Tesseract training intermediate files (large)
+tesseract_train/output/
+tesseract_train/*.checkpoint
+tesseract_train/ground-truth-augmented/
+
+# Training data (large binary files, keep only final models)
+# To regenerate: run training scripts with ground-truth data
+tesseract_train/ground-truth/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
