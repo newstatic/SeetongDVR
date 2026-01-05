@@ -31,11 +31,6 @@ PORT = 8100
 # 全局时区设置
 current_timezone = DEFAULT_TIMEZONE
 
-# 用户可调的时间偏移（秒）
-# 由于 DVR 系统时间与视频水印时间可能存在偏差，用户可以手动调整
-# 正值 = 显示时间向前（更晚），负值 = 显示时间向后（更早）
-time_offset_seconds = 0
-
 
 @dataclass
 class StreamSession:
@@ -271,15 +266,11 @@ class DVRServer:
                 vps_time = int(entry.start_time + progress * entry_duration)
                 vps_times.append(vps_time)
 
-            # 应用用户时间偏移
-            vps_times = [t + time_offset_seconds for t in vps_times]
-
             actual_video_start_time = vps_times[0] if vps_times else entry.start_time
             actual_video_duration = entry_duration
             time_ratio = 1.0
 
             print(f"[Stream] VPS总数: {len(vps_positions)}, 索引时长: {entry_duration}秒")
-            print(f"[Stream] 用户偏移: {time_offset_seconds}秒")
             print(f"[Stream] 实际视频开始: {actual_video_start_time} ({datetime.fromtimestamp(actual_video_start_time, tz=ZoneInfo('Asia/Shanghai')).strftime('%H:%M:%S')})")
 
             # 查找最接近请求时间的 VPS
@@ -689,12 +680,11 @@ async def handle_index(request: web.Request) -> web.Response:
 
 async def handle_get_config(request: web.Request) -> web.Response:
     """GET /api/v1/config - 获取当前配置"""
-    global current_timezone, time_offset_seconds
+    global current_timezone
     result = {
         "storagePath": str(dvr_server.dvr_path) if dvr_server else "",
         "loaded": dvr_server.loaded if dvr_server else False,
         "timezone": current_timezone,
-        "timeOffset": time_offset_seconds,  # 用户可调的时间偏移（秒）
     }
     if dvr_server and dvr_server.loaded:
         result["entryCount"] = len(dvr_server.index_parser.entries)
@@ -704,27 +694,16 @@ async def handle_get_config(request: web.Request) -> web.Response:
 
 async def handle_set_config(request: web.Request) -> web.Response:
     """POST /api/v1/config - 设置配置"""
-    global dvr_server, current_timezone, time_offset_seconds
+    global dvr_server, current_timezone
 
     try:
         data = await request.json()
         new_path = data.get('storagePath')
         new_timezone = data.get('timezone')
-        new_time_offset = data.get('timeOffset')
 
         result = {
             "timezone": current_timezone,
-            "timeOffset": time_offset_seconds,
         }
-
-        # 更新时间偏移
-        if new_time_offset is not None:
-            try:
-                time_offset_seconds = int(new_time_offset)
-                result["timeOffset"] = time_offset_seconds
-                print(f"[Config] 时间偏移已更改为: {time_offset_seconds}秒")
-            except (ValueError, TypeError):
-                return web.json_response({"error": f"无效的时间偏移: {new_time_offset}"}, status=400)
 
         # 更新时区
         if new_timezone:

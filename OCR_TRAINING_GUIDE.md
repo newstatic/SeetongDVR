@@ -26,13 +26,21 @@ tesseract --version
 
 ```
 tesseract_train/
-├── ground-truth/              # Training samples
+├── ground-truth.7z            # Compressed training samples (530 samples)
+├── ground-truth/              # Extracted training samples (ignored by git)
 │   ├── osd.dvr.exp0.0000.tif  # Image file
 │   ├── osd.dvr.exp0.0000.gt.txt  # Ground truth text
 │   ├── osd.dvr.exp0.0000.box  # Character bounding boxes
 │   └── ...
 ├── dvr.traineddata            # Output: trained model
 └── dvr_line_v2.traineddata    # Output: line-based model
+```
+
+### Extract Training Data
+
+```bash
+cd tesseract_train
+7z x ground-truth.7z
 ```
 
 ## Step 1: Extract Training Samples

@@ -53,8 +53,8 @@ tesseract_train/output/
 tesseract_train/*.checkpoint
 tesseract_train/ground-truth-augmented/
 
-# Training data (large binary files, keep only final models)
-# To regenerate: run training scripts with ground-truth data
+# Training data (large binary files)
+# Use ground-truth.7z for compressed training data
 tesseract_train/ground-truth/
 
 # Logs
