@@ -138,6 +138,10 @@ func (s *DVRServer) BuildVPSCache() error {
 				EndTime:     entry.EndTime,
 			})
 			cachedCount++
+			if cachedCount <= 3 {
+				fmt.Printf("[VPS Cache] 条目示例: FileIndex=%d, Channel=%d, Start=%d, End=%d\n",
+					entry.EntryIndex, entry.Channel, entry.StartTime, entry.EndTime)
+			}
 		}
 
 		s.updateProgress(i + 1)

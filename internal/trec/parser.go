@@ -23,8 +23,8 @@ const (
 // 有效通道
 var validChannels = map[uint32]bool{
 	2:   true, // Video CH1
-	3:   true, // Video CH2
-	258: true, // Audio
+	3:   true, // Audio
+	258: true, // Video CH2
 }
 
 // ParseFrameIndex 解析 TRec 文件的帧索引
@@ -74,7 +74,7 @@ func ParseFrameIndex(filePath string) ([]models.FrameIndexRecord, error) {
 		}
 
 		// 解析索引条目
-		// 结构: magic(4) + frame_type(4) + channel(4) + frame_seq(4) + offset(4) + size(4) + timestamp_us(8) + unix_ts(4) + reserved(8)
+		// 文件结构: magic(4) + frame_type(4) + channel(4) + frame_seq(4) + offset(4) + size(4) + timestamp_us(8) + unix_ts(4) + reserved(8)
 		frameType := binary.LittleEndian.Uint32(entry[4:8])
 		channel := binary.LittleEndian.Uint32(entry[8:12])
 		frameSeq := binary.LittleEndian.Uint32(entry[12:16])
@@ -85,13 +85,14 @@ func ParseFrameIndex(filePath string) ([]models.FrameIndexRecord, error) {
 
 		// 过滤有效记录
 		if unixTs > MinValidTime && validChannels[channel] {
+			// 注意: FrameIndexRecord 结构体字段顺序已优化为内存对齐 (TimestampUs 在开头)
 			records = append(records, models.FrameIndexRecord{
+				TimestampUs: timestampUs,
 				FrameType:   frameType,
 				Channel:     channel,
 				FrameSeq:    frameSeq,
 				FileOffset:  fileOffset,
 				FrameSize:   frameSize,
-				TimestampUs: timestampUs,
 				UnixTs:      unixTs,
 			})
 		}

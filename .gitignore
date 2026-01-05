@@ -63,3 +63,6 @@ tesseract_train/ground-truth/
 # Temporary files
 *.tmp
 *.temp
+.index_cache/
+seetong-dvr
+

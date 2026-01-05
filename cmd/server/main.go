@@ -13,7 +13,7 @@ import (
 )
 
 func main() {
-	port := flag.Int("port", 8000, "Server port")
+	port := flag.Int("port", 8091, "Server port")
 	dvrPath := flag.String("path", "/Volumes/DVR-2T/Seetong/Stream", "DVR base path")
 	webPath := flag.String("web", "./web/dist", "Web static files path")
 	flag.Parse()

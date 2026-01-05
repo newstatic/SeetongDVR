@@ -58,6 +58,12 @@ func (h *Handlers) HandleWebSocket(ctx iris.Context) {
 	sessionID := fmt.Sprintf("%p", ws)
 	fmt.Printf("[WS] 新连接: %s\n", sessionID)
 
+	// 发送连接确认
+	session.sendJSON(map[string]interface{}{
+		"type":    "connected",
+		"message": "WebSocket 连接成功",
+	})
+
 	for {
 		_, message, err := ws.ReadMessage()
 		if err != nil {
@@ -67,11 +73,17 @@ func (h *Handlers) HandleWebSocket(ctx iris.Context) {
 			break
 		}
 
+		fmt.Printf("[WS] 收到消息: %s\n", string(message))
+
 		var msg WSMessage
 		if err := json.Unmarshal(message, &msg); err != nil {
+			fmt.Printf("[WS] JSON 解析错误: %v\n", err)
 			session.sendJSON(map[string]interface{}{"error": "无效的 JSON"})
 			continue
 		}
+
+		fmt.Printf("[WS] 解析结果: action=%s, ch=%d, ts=%d, speed=%.1f, audio=%v\n",
+			msg.Action, msg.Channel, msg.Timestamp, msg.Speed, msg.Audio)
 
 		switch msg.Action {
 		case "play":
@@ -79,13 +91,13 @@ func (h *Handlers) HandleWebSocket(ctx iris.Context) {
 			if msg.Speed == 0 {
 				msg.Speed = 1.0
 			}
+			fmt.Printf("[WS] 开始播放: ch=%d, ts=%d, speed=%.1f, audio=%v\n",
+				msg.Channel, msg.Timestamp, msg.Speed, msg.Audio)
 			if msg.Audio {
 				go session.streamVideoWithAudio(msg.Channel, msg.Timestamp, msg.Speed)
 			} else {
 				go session.streamVideo(msg.Channel, msg.Timestamp, msg.Speed)
 			}
-			fmt.Printf("[WS] 开始播放: ch=%d, ts=%d, speed=%.1f, audio=%v\n",
-				msg.Channel, msg.Timestamp, msg.Speed, msg.Audio)
 
 		case "pause":
 			session.stop()
@@ -147,18 +159,24 @@ func (s *StreamSession) streamVideo(channel int, startTimestamp int64, speed flo
 		s.mu.Unlock()
 	}()
 
+	fmt.Printf("[Stream] 请求: ch=%d, ts=%d, speed=%.1f\n", channel, startTimestamp, speed)
+
 	// 查找录像
 	entry := s.findEntryForTime(startTimestamp, channel)
 	if entry == nil {
+		fmt.Printf("[Stream] 错误: 未找到指定时间的录像 (ts=%d, ch=%d)\n", startTimestamp, channel)
 		s.sendJSON(map[string]interface{}{"error": "未找到指定时间的录像"})
 		return
 	}
+	fmt.Printf("[Stream] 找到录像: FileIndex=%d, RecFile=%s\n", entry.FileIndex, entry.RecFile)
 
 	records := s.dvr.GetFrameIndex(entry.FileIndex)
 	if records == nil {
+		fmt.Printf("[Stream] 错误: 帧索引不存在 (FileIndex=%d)\n", entry.FileIndex)
 		s.sendJSON(map[string]interface{}{"error": "帧索引不存在"})
 		return
 	}
+	fmt.Printf("[Stream] 帧索引: %d 条记录\n", len(records))
 
 	// 筛选视频帧
 	var videoFrames []int
@@ -265,18 +283,24 @@ func (s *StreamSession) streamVideoWithAudio(channel int, startTimestamp int64, 
 		s.mu.Unlock()
 	}()
 
+	fmt.Printf("[StreamAV] 请求: ch=%d, ts=%d, speed=%.1f\n", channel, startTimestamp, speed)
+
 	// 查找录像
 	entry := s.findEntryForTime(startTimestamp, channel)
 	if entry == nil {
+		fmt.Printf("[StreamAV] 错误: 未找到指定时间的录像 (ts=%d, ch=%d)\n", startTimestamp, channel)
 		s.sendJSON(map[string]interface{}{"error": "未找到指定时间的录像"})
 		return
 	}
+	fmt.Printf("[StreamAV] 找到录像: FileIndex=%d, RecFile=%s\n", entry.FileIndex, entry.RecFile)
 
 	records := s.dvr.GetFrameIndex(entry.FileIndex)
 	if records == nil {
+		fmt.Printf("[StreamAV] 错误: 帧索引不存在 (FileIndex=%d)\n", entry.FileIndex)
 		s.sendJSON(map[string]interface{}{"error": "帧索引不存在"})
 		return
 	}
+	fmt.Printf("[StreamAV] 帧索引: %d 条记录\n", len(records))
 
 	// 分离视频帧和音频帧
 	var videoFrames, audioFrames []int
@@ -341,15 +365,31 @@ func (s *StreamSession) streamVideoWithAudio(channel int, startTimestamp int64, 
 	headerSent := false
 	var headerBytes []byte
 
+	fmt.Printf("[StreamAV] 首帧解析到 %d 个 NAL 单元\n", len(nalUnits))
+	for i, nal := range nalUnits {
+		fmt.Printf("[StreamAV]   NAL[%d]: type=%d, offset=%d, size=%d\n", i, nal.nalType, nal.offset, nal.size)
+		if i >= 10 {
+			fmt.Printf("[StreamAV]   ... 省略剩余 %d 个\n", len(nalUnits)-10)
+			break
+		}
+	}
+
 	for _, nal := range nalUnits {
 		if nal.nalType == NAL_VPS || nal.nalType == NAL_SPS || nal.nalType == NAL_PPS {
 			headerBytes = append(headerBytes, headerData[nal.offset:nal.offset+nal.size]...)
+			fmt.Printf("[StreamAV] 收集到 NAL type=%d, 累计 headerBytes=%d\n", nal.nalType, len(headerBytes))
 		} else if nal.nalType == NAL_IDR_W_RADL || nal.nalType == NAL_IDR_N_LP {
 			if len(headerBytes) > 0 {
-				for _, h := range parseNALUnits(headerBytes) {
-					s.sendVideoFrame(stripStartCode(headerBytes[h.offset:h.offset+h.size]), h.nalType, actualStartTime*1000)
+				headerNals := parseNALUnits(headerBytes)
+				fmt.Printf("[StreamAV] headerBytes 解析出 %d 个 NAL\n", len(headerNals))
+				for _, h := range headerNals {
+					nalData := stripStartCode(headerBytes[h.offset : h.offset+h.size])
+					fmt.Printf("[StreamAV] 发送 NAL type=%d, size=%d (去除start code后)\n", h.nalType, len(nalData))
+					s.sendVideoFrame(nalData, h.nalType, actualStartTime*1000)
 				}
 				fmt.Printf("[StreamAV] 已发送视频头，大小=%d 字节\n", len(headerBytes))
+			} else {
+				fmt.Printf("[StreamAV] 警告: 遇到 IDR 但没有收集到 VPS/SPS/PPS!\n")
 			}
 			idrData := stripStartCode(headerData[nal.offset : nal.offset+nal.size])
 			s.sendVideoFrame(idrData, nal.nalType, actualStartTime*1000)
@@ -434,9 +474,13 @@ func (s *StreamSession) streamVideoWithAudio(channel int, startTimestamp int64, 
 
 func (s *StreamSession) findEntryForTime(timestamp int64, channel int) *models.VPSCacheEntry {
 	entries := s.dvr.GetVPSCache()
+	fmt.Printf("[findEntry] VPSCache 条目数: %d, 查找: ts=%d, ch=%d\n", len(entries), timestamp, channel)
+
 	for i := range entries {
 		e := &entries[i]
 		if e.Channel == channel && e.StartTime <= timestamp && timestamp <= e.EndTime {
+			fmt.Printf("[findEntry] 找到匹配(精确通道): FileIndex=%d, ch=%d, start=%d, end=%d\n",
+				e.FileIndex, e.Channel, e.StartTime, e.EndTime)
 			return e
 		}
 	}
@@ -444,9 +488,19 @@ func (s *StreamSession) findEntryForTime(timestamp int64, channel int) *models.V
 	for i := range entries {
 		e := &entries[i]
 		if e.StartTime <= timestamp && timestamp <= e.EndTime {
+			fmt.Printf("[findEntry] 找到匹配(任意通道): FileIndex=%d, ch=%d, start=%d, end=%d\n",
+				e.FileIndex, e.Channel, e.StartTime, e.EndTime)
 			return e
 		}
 	}
+
+	// 打印前5个条目用于调试
+	fmt.Printf("[findEntry] 未找到匹配，打印前5个条目:\n")
+	for i := 0; i < len(entries) && i < 5; i++ {
+		e := &entries[i]
+		fmt.Printf("  [%d] ch=%d, start=%d, end=%d\n", e.FileIndex, e.Channel, e.StartTime, e.EndTime)
+	}
+
 	return nil
 }
 
