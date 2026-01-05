@@ -7,8 +7,10 @@ import { PlayerControls } from './components/PlayerControls';
 import { StatsPanel } from './components/StatsPanel';
 import { LogPanel, type LogEntry } from './components/LogPanel';
 import { SettingsPanel } from './components/SettingsPanel';
+import { SetupWizard } from './components/SetupWizard';
 import { useWebSocket } from './hooks/useWebSocket';
 import { HEVCDecoder, type DecoderStats } from './lib/hevc-decoder';
+import { AudioPlayer } from './lib/audio-player';
 import {
   getRecordingDates,
   getRecordings,
@@ -26,6 +28,9 @@ import {
 } from './stores/settings';
 
 function App() {
+  // 启动向导状态
+  const [setupComplete, setSetupComplete] = useState(false);
+
   // 加载保存的设置
   const initialSettings = loadSettings();
 
@@ -54,8 +59,13 @@ function App() {
   const [storagePath, setStoragePathState] = useState<string>(initialSettings.storagePath);
   const [timeOffset, setTimeOffsetState] = useState<number>(initialSettings.timeOffset);
 
+  // 音频状态
+  const [isMuted, setIsMuted] = useState(false);
+  const [volume, setVolume] = useState(1.0);
+
   // Refs
   const decoderRef = useRef<HEVCDecoder | null>(null);
+  const audioPlayerRef = useRef<AudioPlayer | null>(null);
   const frameCallbackRef = useRef<((frame: VideoFrame) => void) | null>(null);
   const videoPlayerRef = useRef<VideoPlayerHandle>(null);
   const logIdRef = useRef(0);
@@ -92,6 +102,19 @@ function App() {
   }, []);
 
   const handleMessage = useCallback((data: ArrayBuffer) => {
+    const view = new Uint8Array(data);
+
+    // 检查是否是音频帧 (Magic: 'G711')
+    if (view.length >= 18 &&
+        view[0] === 0x47 && view[1] === 0x37 && view[2] === 0x31 && view[3] === 0x31) {
+      // 音频数据
+      if (audioPlayerRef.current) {
+        audioPlayerRef.current.processAudioData(data);
+      }
+      return;
+    }
+
+    // 视频数据
     if (decoderRef.current) {
       decoderRef.current.processData(data);
     }
@@ -110,7 +133,7 @@ function App() {
     hasConnectedRef.current = true;
 
     const init = async () => {
-      // 初始化解码器
+      // 初始化视频解码器
       if (!decoderRef.current) {
         decoderRef.current = new HEVCDecoder({
           onFrame: (frame) => {
@@ -139,6 +162,18 @@ function App() {
       }
       await decoderRef.current.init();
 
+      // 初始化音频播放器
+      if (!audioPlayerRef.current) {
+        audioPlayerRef.current = new AudioPlayer({
+          onLog: addLog,
+        });
+      }
+      try {
+        await audioPlayerRef.current.init();
+      } catch (e) {
+        addLog(`音频初始化失败: ${(e as Error).message}`, 'error');
+      }
+
       // 连接 WebSocket
       connect(getStreamUrl());
     };
@@ -147,8 +182,10 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 加载录像日期
+  // 加载录像日期（在 setupComplete 后执行）
   useEffect(() => {
+    if (!setupComplete) return;
+
     const loadDates = async () => {
       try {
         const data = await getRecordingDates();
@@ -165,7 +202,7 @@ function App() {
     };
     loadDates();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [setupComplete]);
 
   // 日期选择
   const handleDateSelect = useCallback(async (date: string) => {
@@ -218,44 +255,74 @@ function App() {
         await decoderRef.current.init();
       }
 
+      // 恢复和重置音频播放器
+      if (audioPlayerRef.current) {
+        await audioPlayerRef.current.resume();
+        audioPlayerRef.current.reset();
+      }
+
       // 发送 seek 命令
       sendCommand({
         action: 'seek',
         channel: recording.channel,
         timestamp,
         speed: playbackRate,
+        audio: true,
       });
       setIsPlaying(true);
     }
   }, [recordings, selectedChannels, playbackRate, sendCommand, addLog, timezone]);
 
   // 播放控制
-  const handlePlayPause = useCallback(() => {
+  const handlePlayPause = useCallback(async () => {
     const newPlaying = !isPlaying;
     setIsPlaying(newPlaying);
 
     if (newPlaying) {
       const ts = currentTime ?? startTime;
+
+      // 恢复音频上下文（需要用户交互后才能播放）
+      if (audioPlayerRef.current) {
+        await audioPlayerRef.current.resume();
+        audioPlayerRef.current.reset(); // 清空旧的音频队列
+      }
+
       sendCommand({
         action: 'play',
         channel: currentChannel,
         timestamp: ts,
         speed: playbackRate,
+        audio: true, // 启用音频
       });
       addLog('开始播放', 'info');
     } else {
       sendCommand({ action: 'pause' });
+      if (audioPlayerRef.current) {
+        audioPlayerRef.current.reset();
+      }
       addLog('暂停播放', 'info');
     }
   }, [isPlaying, currentTime, startTime, currentChannel, playbackRate, sendCommand, addLog]);
 
-  const handleSeek = useCallback((timestamp: number) => {
+  const handleSeek = useCallback(async (timestamp: number) => {
     setCurrentTime(timestamp);
+
+    // 重置解码器状态以准备新的视频流
+    if (decoderRef.current) {
+      await decoderRef.current.init();
+    }
+
+    // 重置音频播放器
+    if (audioPlayerRef.current) {
+      audioPlayerRef.current.reset();
+    }
+
     sendCommand({
       action: 'seek',
       channel: currentChannel,
       timestamp,
       speed: playbackRate,
+      audio: true,
     });
   }, [currentChannel, playbackRate, sendCommand]);
 
@@ -281,6 +348,28 @@ function App() {
   const handleStepForward = useCallback(() => {
     addLog('逐帧前进 (暂不支持)', 'info');
   }, [addLog]);
+
+  // 音量控制
+  const handleMuteToggle = useCallback(() => {
+    const newMuted = !isMuted;
+    setIsMuted(newMuted);
+    if (audioPlayerRef.current) {
+      audioPlayerRef.current.setMuted(newMuted);
+    }
+    addLog(newMuted ? '已静音' : '已取消静音', 'info');
+  }, [isMuted, addLog]);
+
+  const handleVolumeChange = useCallback((newVolume: number) => {
+    setVolume(newVolume);
+    if (audioPlayerRef.current) {
+      audioPlayerRef.current.setVolume(newVolume);
+      // 如果调整音量到非零，取消静音
+      if (newVolume > 0 && isMuted) {
+        setIsMuted(false);
+        audioPlayerRef.current.setMuted(false);
+      }
+    }
+  }, [isMuted]);
 
   // 连接处理
   const handleConnect = useCallback(async () => {
@@ -441,6 +530,11 @@ function App() {
     checkSupport();
   }, [addLog]);
 
+  // 显示启动向导
+  if (!setupComplete) {
+    return <SetupWizard onComplete={() => setSetupComplete(true)} />;
+  }
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
       {/* Header */}
@@ -545,6 +639,8 @@ function App() {
               duration={duration}
               startTime={startTime}
               playbackRate={playbackRate}
+              isMuted={isMuted}
+              volume={volume}
               onPlayPause={handlePlayPause}
               onSeek={handleSeek}
               onRateChange={handleRateChange}
@@ -552,6 +648,8 @@ function App() {
               onScreenshot={handleScreenshot}
               onStepBackward={handleStepBackward}
               onStepForward={handleStepForward}
+              onMuteToggle={handleMuteToggle}
+              onVolumeChange={handleVolumeChange}
             />
 
             {/* 时间线 */}

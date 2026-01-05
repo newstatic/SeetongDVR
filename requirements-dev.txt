@@ -1,0 +1,8 @@
+# Development dependencies (OCR training and frame extraction)
+-r requirements.txt
+
+# Image processing
+pillow>=10.0.0
+
+# Data augmentation
+numpy>=1.24.0

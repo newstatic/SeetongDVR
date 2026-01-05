@@ -1,2 +1,3 @@
+# Production dependencies (server.py)
 aiohttp>=3.9.0
 aiohttp-cors>=0.7.0

@@ -25,6 +25,14 @@ export interface RecordingsResponse {
   error?: string;
 }
 
+export interface CacheStatus {
+  status: 'not_loaded' | 'building' | 'ready';
+  progress: number;
+  total: number;
+  current: number;
+  cached: number;
+}
+
 export interface ConfigResponse {
   storagePath: string;
   loaded: boolean;
@@ -32,6 +40,7 @@ export interface ConfigResponse {
   timeOffset?: number;
   entryCount?: number;
   fileCount?: number;
+  cacheStatus?: CacheStatus;
   error?: string;
 }
 
@@ -149,6 +158,7 @@ export interface PlayCommand {
   channel: number;
   timestamp: number;
   speed?: number;
+  audio?: boolean;
 }
 
 export interface PauseCommand {
@@ -160,6 +170,7 @@ export interface SeekCommand {
   channel: number;
   timestamp: number;
   speed?: number;
+  audio?: boolean;
 }
 
 export interface SpeedCommand {
@@ -168,6 +179,17 @@ export interface SpeedCommand {
 }
 
 export type StreamCommand = PlayCommand | PauseCommand | SeekCommand | SpeedCommand;
+
+/**
+ * 获取缓存状态
+ */
+export async function getCacheStatus(): Promise<CacheStatus> {
+  const response = await fetch(`${API_BASE}/api/v1/cache/status`);
+  if (!response.ok) {
+    throw new Error(`API 错误: ${response.status}`);
+  }
+  return response.json();
+}
 
 /**
  * 获取 WebSocket URL

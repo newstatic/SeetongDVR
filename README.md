@@ -98,7 +98,7 @@ SeetongDVR/
 ├── dvr.py                      # Core TPS index parser
 ├── tps_storage_lib.py          # Storage library with precise timing
 ├── server.py                   # Web server (REST + WebSocket)
-├── precise_frame_extractor.py  # Frame extraction utilities
+├── precise_frame_extractor_final.py  # Frame extraction with OCR
 ├── requirements.txt            # Python dependencies
 ├── tesseract_train/            # OCR training data and models
 │   ├── dvr.traineddata         # Base OCR model

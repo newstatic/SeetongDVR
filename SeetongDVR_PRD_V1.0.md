@@ -52,10 +52,11 @@
 
 | 层级 | 技术选型 | 说明 |
 |------|----------|------|
-| 后端 | Python + WebSocket | TPS解析与视频流服务 |
+| 后端 | Python + aiohttp | TPS解析与音视频流服务 |
 | 前端框架 | React 18 + TypeScript | 响应式UI框架 |
 | UI样式 | Tailwind CSS | 原子化CSS框架 |
 | 视频解码 | WebCodecs API | 浏览器原生H.265硬件加速解码 |
+| 音频解码 | WebAudio API | G.711 μ-law 软解码 + 播放 |
 | 通信协议 | WebSocket | 全双工实时通信 |
 | 视频渲染 | Canvas 2D | 视频帧渲染 |
 | 构建工具 | Vite | 快速开发构建工具 |
@@ -174,20 +175,30 @@ ws://{host}:{port}/api/v1/stream
 
 **客户端 → 服务端（JSON）：**
 
-- `play`: `{ "action": "play", "channel": 1, "timestamp": 1766034449 }`
+- `play`: `{ "action": "play", "channel": 1, "timestamp": 1766034449, "audio": true }`
 - `pause`: `{ "action": "pause" }`
-- `seek`: `{ "action": "seek", "timestamp": 1766041804 }`
+- `seek`: `{ "action": "seek", "channel": 1, "timestamp": 1766041804, "audio": true }`
 - `speed`: `{ "action": "speed", "rate": 2.0 }`
 
-**服务端 → 客户端（二进制帧）：**
+**服务端 → 客户端（视频二进制帧）：**
 
 | 字段 | 大小 | 说明 |
 |------|------|------|
 | Magic | 4 bytes | 0x48323635 ('H265') |
-| Timestamp | 8 bytes | Unix时间戳（毫秒） |
+| Timestamp | 8 bytes | Unix时间戳（毫秒，大端序） |
 | FrameType | 1 byte | 0=P帧, 1=I帧, 2=VPS, 3=SPS, 4=PPS |
-| DataLen | 4 bytes | NAL数据长度 |
-| Data | N bytes | H.265 NAL单元数据（含起始码） |
+| DataLen | 4 bytes | NAL数据长度（大端序） |
+| Data | N bytes | H.265 NAL单元数据（不含起始码） |
+
+**服务端 → 客户端（音频二进制帧）：**
+
+| 字段 | 大小 | 说明 |
+|------|------|------|
+| Magic | 4 bytes | 0x47373131 ('G711') |
+| Timestamp | 8 bytes | Unix时间戳（毫秒，大端序） |
+| SampleRate | 2 bytes | 采样率（8000，大端序） |
+| DataLen | 4 bytes | 音频数据长度（大端序） |
+| Data | N bytes | G.711 μ-law 编码的音频数据 |
 
 ---
 
@@ -286,11 +297,97 @@ ws://{host}:{port}/api/v1/stream
 
 ### A.2 录像文件格式 (TRec*.tps)
 
-录像文件为纯H.265 Annex B格式裸流，每个文件固定256MB。
+每个 TRec 文件固定 256MB，包含数据区域和索引区域两部分。
+
+#### A.2.1 文件布局
+
+```
+TRec 文件布局 (256 MB = 0x10000000):
+┌─────────────────────────────────────────────────────────────────┐
+│  数据区域 (Data Region)                                          │
+│  偏移: 0x00000000 - 0x0F8FFFFF (约 249 MB)                       │
+│                                                                   │
+│  内容：                                                           │
+│  - H.265 视频帧 (VPS/SPS/PPS + IDR + P帧)                        │
+│  - G.711 μ-law 音频帧                                            │
+│  - 数据按时间顺序交织存储                                         │
+├─────────────────────────────────────────────────────────────────┤
+│  索引区域 (Index Region)                                          │
+│  偏移: 0x0F900000 - 0x0FFFFFFF (约 7 MB)                          │
+│                                                                   │
+│  结构：                                                           │
+│  0x0F900000: 索引头部 (40 字节)                                   │
+│  0x0F900028: 帧索引记录数组 (每条 44 字节, 按时间倒序)             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### A.2.2 帧索引记录结构 (44 字节)
+
+每条帧索引记录描述一个视频帧或音频帧的位置信息：
+
+```
+偏移    大小    字段             类型        描述
+0x00    4       magic            uint32_LE   固定值 0x4C3D2E1F
+0x04    4       frame_type       uint32_LE   1=I帧, 3=P帧或音频帧
+0x08    4       channel          uint32_LE   2=视频CH1, 3=音频, 258=视频CH2
+0x0C    4       frame_seq        uint32_LE   帧序号
+0x10    4       file_offset      uint32_LE   数据区域内的字节偏移
+0x14    4       frame_size       uint32_LE   帧数据大小（字节）
+0x18    8       timestamp_us     uint64_LE   设备单调时钟（微秒级）
+0x20    4       unix_ts          uint32_LE   Unix 时间戳（秒）
+0x24    8       reserved         -           保留
+```
+
+**通道定义：**
+| 通道值 | 含义 |
+|--------|------|
+| 2 | 视频通道 1（主通道）|
+| 3 | 音频通道 |
+| 258 | 视频通道 2（子码流/第二摄像头）|
+
+**帧类型定义：**
+| 帧类型 | 含义 |
+|--------|------|
+| 1 | I 帧（关键帧）|
+| 3 | P 帧 或 音频帧 |
+
+#### A.2.3 视频格式
 
 - NAL起始码: `0x00 0x00 0x00 0x01`
 - 文件开头: VPS (0x40) → SPS (0x42) → PPS (0x44) → IDR帧 (0x26)
 - 支持的NAL类型: VPS(32), SPS(33), PPS(34), IDR(19/20), TRAIL(0/1)
+- 视频帧率: 约 166 fps（每帧约 6ms）
+
+#### A.2.4 音频格式
+
+```
+音频编码参数:
+┌─────────────────────────────────────────┐
+│ 编码格式    │ G.711 μ-law               │
+│ 采样率      │ 8000 Hz                   │
+│ 位深度      │ 8 bit                     │
+│ 通道数      │ 1（单声道）                │
+│ 帧大小      │ 1280 字节                 │
+│ 帧时长      │ 160 ms                    │
+└─────────────────────────────────────────┘
+```
+
+**G.711 μ-law 解码算法：**
+
+```python
+# μ-law 解码表（取反后查表）
+ULAW_DECODE_TABLE = []
+for i in range(256):
+    sign = -1 if (i & 0x80) else 1
+    exponent = (i >> 4) & 0x07
+    mantissa = i & 0x0F
+    magnitude = ((mantissa << 3) + 0x84) << exponent
+    ULAW_DECODE_TABLE.append(sign * (magnitude - 0x84))
+
+def decode_ulaw(ulaw_data: bytes) -> list:
+    """将 G.711 μ-law 解码为 PCM 16-bit"""
+    return [ULAW_DECODE_TABLE[~b & 0xFF] for b in ulaw_data]
+```
 
 ---
 
@@ -388,7 +485,7 @@ def find_vps_in_range(file_handle, start: int, end: int) -> List[int]:
 | 文件 | 功能 |
 |------|------|
 | `tps_storage_lib.py` | 核心库，包含 `calculate_vps_precise_time()` 等函数 |
-| `precise_frame_extractor.py` | 精确帧提取器，封装完整的提取流程 |
+| `precise_frame_extractor_final.py` | 精确帧提取器，封装完整提取流程及 OCR 校验 |
 
 ---
 

@@ -18,8 +18,14 @@ brew install tesseract tesseract-lang  # macOS
 # or
 sudo apt install tesseract-ocr libtesseract-dev  # Ubuntu
 
+# Install 7z for extracting training data
+brew install p7zip  # macOS
+# or
+sudo apt install p7zip-full  # Ubuntu
+
 # Verify installation
 tesseract --version
+7z --help
 ```
 
 ## Training Data Structure
@@ -32,18 +38,101 @@ tesseract_train/
 │   ├── osd.dvr.exp0.0000.gt.txt  # Ground truth text
 │   ├── osd.dvr.exp0.0000.box  # Character bounding boxes
 │   └── ...
-├── dvr.traineddata            # Output: trained model
-└── dvr_line_v2.traineddata    # Output: line-based model
+├── scripts/                   # Training and testing scripts
+│   ├── train_line_v2.py       # Main training script with augmentation
+│   ├── augment_data.py        # Data augmentation utility
+│   ├── extract_training_data.py  # Extract OSD from frames
+│   ├── test_trained_model.py  # Test model accuracy
+│   └── verify_vps_ocr.py      # Verify OCR on VPS-extracted frames
+└── dvr_line_v2.traineddata    # Trained OCR model (line-optimized)
 ```
 
 ### Extract Training Data
 
+Before training, extract the compressed ground truth data:
+
 ```bash
 cd tesseract_train
-7z x ground-truth.7z
+7z x ground-truth.7z -oground-truth
 ```
 
-## Step 1: Extract Training Samples
+This will create a `ground-truth/` directory with 530 training samples:
+- `.tif` files: Preprocessed OSD images
+- `.gt.txt` files: Ground truth text labels
+- `.box` files: Character bounding boxes
+- `.lstmf` files: LSTM training features
+
+## Quick Start: Use Existing Samples
+
+The included training data is ready to use. Skip to Step 4 if you want to train with existing samples.
+
+## Quick Start: Use Training Scripts
+
+The `scripts/` directory contains ready-to-use Python scripts for the complete training workflow:
+
+### 1. Extract Training Data from Frames
+
+```bash
+cd tesseract_train/scripts
+python extract_training_data.py
+```
+
+This extracts OSD regions from video frames and creates ground-truth files.
+
+### 2. Augment Training Data
+
+```bash
+python augment_data.py
+```
+
+Creates 10x more training samples with variations (rotation, brightness, contrast, noise, scale).
+
+### 3. Train the Model
+
+```bash
+python train_line_v2.py
+```
+
+This script:
+- Generates LSTMF files from ground truth
+- Creates train/validation split (90/10)
+- Fine-tunes from English model with 10,000 iterations
+- Creates final `.traineddata` file
+
+### 4. Test Model Accuracy
+
+```bash
+python test_trained_model.py
+```
+
+Compares trained model vs default English model on test samples.
+
+### 5. Verify on Real Frames
+
+```bash
+python verify_vps_ocr.py
+```
+
+Tests OCR accuracy on VPS-extracted video frames.
+
+## Step 1: Extract NEW Training Samples
+
+### Using the Frame Extractor Scripts
+
+The project includes two extraction scripts:
+
+1. **`precise_frame_extractor.py`** - Basic extractor using byte-position interpolation
+2. **`precise_frame_extractor_final.py`** - Advanced extractor with OCR verification
+
+```bash
+# Extract frames using the basic extractor
+python precise_frame_extractor.py
+
+# Extract frames with OCR verification (requires trained model)
+python precise_frame_extractor_final.py
+```
+
+### Manual OSD Extraction
 
 Extract OSD regions from video frames:
 
@@ -206,12 +295,11 @@ augmenter = iaa.Sequential([
 augmented = augmenter(image=original)
 ```
 
-## Included Models
+## Included Model
 
 | Model | Description | Best For |
 |-------|-------------|----------|
-| `dvr.traineddata` | Base model | General OSD recognition |
-| `dvr_line_v2.traineddata` | Line-optimized | Full timestamp lines |
+| `dvr_line_v2.traineddata` | Line-optimized model trained with augmented data | Full timestamp lines (YYYY-MM-DD HH:MM:SS) |
 
 ## Troubleshooting
 
