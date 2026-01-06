@@ -68,3 +68,5 @@ seetong-dvr
 
 dvr-server
 go.sum
+seetong-dvr
+seetong-dvr-darwin-*

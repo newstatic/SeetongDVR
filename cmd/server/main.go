@@ -1,11 +1,17 @@
 package main
 
 import (
+	"embed"
 	"flag"
 	"fmt"
+	"io/fs"
+	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"runtime"
 	"syscall"
+	"time"
 
 	"seetong-dvr/internal/seetong"
 	"seetong-dvr/internal/server"
@@ -13,11 +19,14 @@ import (
 	"github.com/kataras/iris/v12"
 )
 
+//go:embed static/*
+var staticFS embed.FS
+
 func main() {
 	port := flag.Int("port", 8000, "Server port")
-	dvrPath := flag.String("path", "/Volumes/NO NAME", "DVR base path")
-	webPath := flag.String("web", "./web/dist", "Web static files path")
-	debug := flag.Bool("debug", true, "Enable debug logging")
+	dvrPath := flag.String("path", "", "DVR base path (optional, can be set via web UI)")
+	debug := flag.Bool("debug", false, "Enable debug logging")
+	noBrowser := flag.Bool("no-browser", false, "Don't open browser automatically")
 	flag.Parse()
 
 	// 设置日志级别
@@ -26,13 +35,15 @@ func main() {
 	}
 
 	fmt.Println("============================================================")
-	fmt.Println("天视通 DVR Web 服务器 (Go)")
+	fmt.Println("天视通 DVR Web 播放器")
 	fmt.Println("============================================================")
-	fmt.Printf("DVR 路径: %s\n", *dvrPath)
+	if *dvrPath != "" {
+		fmt.Printf("DVR 路径: %s\n", *dvrPath)
+	}
 	fmt.Printf("监听地址: http://localhost:%d\n", *port)
 	fmt.Println("============================================================")
 
-	// 创建 DVR 服务器（不立即加载，等待前端设置）
+	// 创建 DVR 服务器
 	dvr := server.NewDVRServer(*dvrPath)
 	defer dvr.Close()
 
@@ -56,15 +67,16 @@ func main() {
 	handlers := server.NewHandlers(dvr)
 	server.RegisterRoutes(app, handlers)
 
-	// 静态文件
-	if _, err := os.Stat(*webPath); err == nil {
-		app.HandleDir("/", iris.Dir(*webPath), iris.DirOptions{
+	// 嵌入的静态文件
+	staticSub, err := fs.Sub(staticFS, "static")
+	if err != nil {
+		fmt.Printf("警告: 无法加载嵌入的静态文件: %v\n", err)
+	} else {
+		app.HandleDir("/", http.FS(staticSub), iris.DirOptions{
 			IndexName: "index.html",
 			SPA:       true,
 		})
-		fmt.Printf("静态文件目录: %s\n", *webPath)
-	} else {
-		fmt.Printf("警告: 静态文件目录不存在: %s\n", *webPath)
+		fmt.Println("静态文件: 嵌入模式")
 	}
 
 	// 优雅关闭
@@ -76,9 +88,33 @@ func main() {
 		app.Shutdown(nil)
 	}()
 
+	// 自动打开浏览器
+	if !*noBrowser {
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			openBrowser(fmt.Sprintf("http://localhost:%d", *port))
+		}()
+	}
+
 	// 启动服务器
 	fmt.Printf("\n服务器已启动: http://localhost:%d\n", *port)
 	if err := app.Listen(fmt.Sprintf(":%d", *port)); err != nil {
 		fmt.Printf("服务器错误: %v\n", err)
+	}
+}
+
+// openBrowser 打开默认浏览器
+func openBrowser(url string) {
+	var err error
+	switch runtime.GOOS {
+	case "darwin":
+		err = exec.Command("open", url).Start()
+	case "linux":
+		err = exec.Command("xdg-open", url).Start()
+	case "windows":
+		err = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+	}
+	if err != nil {
+		fmt.Printf("无法自动打开浏览器，请手动访问: %s\n", url)
 	}
 }
