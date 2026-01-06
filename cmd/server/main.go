@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -34,13 +35,16 @@ func main() {
 		seetong.SetDebugMode(true)
 	}
 
+	// 查找可用端口
+	actualPort := findAvailablePort(*port)
+
 	fmt.Println("============================================================")
 	fmt.Println("天视通 DVR Web 播放器")
 	fmt.Println("============================================================")
 	if *dvrPath != "" {
 		fmt.Printf("DVR 路径: %s\n", *dvrPath)
 	}
-	fmt.Printf("监听地址: http://localhost:%d\n", *port)
+	fmt.Printf("监听地址: http://localhost:%d\n", actualPort)
 	fmt.Println("============================================================")
 
 	// 创建 DVR 服务器
@@ -92,15 +96,27 @@ func main() {
 	if !*noBrowser {
 		go func() {
 			time.Sleep(500 * time.Millisecond)
-			openBrowser(fmt.Sprintf("http://localhost:%d", *port))
+			openBrowser(fmt.Sprintf("http://localhost:%d", actualPort))
 		}()
 	}
 
 	// 启动服务器
-	fmt.Printf("\n服务器已启动: http://localhost:%d\n", *port)
-	if err := app.Listen(fmt.Sprintf(":%d", *port)); err != nil {
+	fmt.Printf("\n服务器已启动: http://localhost:%d\n", actualPort)
+	if err := app.Listen(fmt.Sprintf(":%d", actualPort)); err != nil {
 		fmt.Printf("服务器错误: %v\n", err)
 	}
+}
+
+// findAvailablePort 查找可用端口，如果指定端口被占用则递增
+func findAvailablePort(startPort int) int {
+	for port := startPort; port < startPort+100; port++ {
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err == nil {
+			ln.Close()
+			return port
+		}
+	}
+	return startPort // 回退到原始端口
 }
 
 // openBrowser 打开默认浏览器
