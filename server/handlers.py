@@ -72,9 +72,9 @@ async def handle_get_config(request: web.Request) -> web.Response:
         "loaded": dvr_server.loaded if dvr_server else False,
         "timezone": current_timezone,
     }
-    if dvr_server and dvr_server.loaded:
-        result["entryCount"] = len(dvr_server.index_parser.entries)
-        result["fileCount"] = len(dvr_server.video_parser.rec_files)
+    if dvr_server and dvr_server.loaded and dvr_server.storage:
+        result["entryCount"] = len(dvr_server.storage.segments)
+        result["fileCount"] = len(list(dvr_server.dvr_path.glob('TRec*.tps')))
         result["cacheStatus"] = dvr_server.get_cache_status()
     return web.json_response(result)
 
@@ -104,25 +104,28 @@ async def handle_set_config(request: web.Request) -> web.Response:
 
         # 更新存储路径
         if new_path:
+            print(f"[Config] 正在加载新路径: {new_path}")
             new_server = DVRServer(new_path)
             if new_server.load():
                 dvr_server = new_server
                 # 标记为正在构建
                 dvr_server._cache_building = True
-                dvr_server._cache_total = len(dvr_server.index_parser.entries)
+                dvr_server._cache_total = len(dvr_server.storage.segments)
                 dvr_server._cache_current = 0
                 dvr_server._cache_progress = 0
                 result.update({
                     "storagePath": str(dvr_server.dvr_path),
                     "loaded": True,
-                    "entryCount": len(dvr_server.index_parser.entries),
-                    "fileCount": len(dvr_server.video_parser.rec_files),
+                    "entryCount": len(dvr_server.storage.segments),
+                    "fileCount": len(list(dvr_server.dvr_path.glob('TRec*.tps'))),
                     "cacheStatus": dvr_server.get_cache_status(),
                 })
                 # 在后台线程中构建 VPS 缓存
                 loop = asyncio.get_event_loop()
                 loop.run_in_executor(None, dvr_server.build_vps_cache)
+                print(f"[Config] 加载成功，共 {len(dvr_server.storage.segments)} 个段落")
             else:
+                print(f"[Config] 加载失败: {new_path}")
                 return web.json_response({
                     "storagePath": new_path,
                     "loaded": False,
@@ -133,15 +136,18 @@ async def handle_set_config(request: web.Request) -> web.Response:
                 "storagePath": str(dvr_server.dvr_path) if dvr_server else "",
                 "loaded": dvr_server.loaded if dvr_server else False,
             })
-            if dvr_server and dvr_server.loaded:
-                result["entryCount"] = len(dvr_server.index_parser.entries)
-                result["fileCount"] = len(dvr_server.video_parser.rec_files)
+            if dvr_server and dvr_server.loaded and dvr_server.storage:
+                result["entryCount"] = len(dvr_server.storage.segments)
+                result["fileCount"] = len(list(dvr_server.dvr_path.glob('TRec*.tps')))
 
         return web.json_response(result)
 
     except json.JSONDecodeError:
         return web.json_response({"error": "无效的 JSON"}, status=400)
     except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"[Config] 异常: {e}")
         return web.json_response({"error": str(e)}, status=500)
 
 
@@ -181,20 +187,14 @@ async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
                         channel = data.get('channel', 1)
                         timestamp = data.get('timestamp', int(time.time()))
                         speed = data.get('speed', 1.0)
-                        with_audio = data.get('audio', True)
 
                         if stream_task and not stream_task.done():
                             stream_task.cancel()
 
-                        if with_audio:
-                            stream_task = asyncio.create_task(
-                                dvr_server.stream_video_with_audio(ws, channel, timestamp, speed)
-                            )
-                        else:
-                            stream_task = asyncio.create_task(
-                                dvr_server.stream_video(ws, channel, timestamp, speed)
-                            )
-                        print(f"[WS] 开始播放: ch={channel}, ts={timestamp}, speed={speed}, audio={with_audio}")
+                        stream_task = asyncio.create_task(
+                            dvr_server.stream_video_with_audio(ws, channel, timestamp, speed)
+                        )
+                        print(f"[WS] 开始播放: ch={channel}, ts={timestamp}, speed={speed}")
 
                     elif action == 'pause':
                         if stream_task and not stream_task.done():
@@ -206,20 +206,14 @@ async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
                         timestamp = data.get('timestamp')
                         channel = data.get('channel', 1)
                         speed = data.get('speed', 1.0)
-                        with_audio = data.get('audio', True)
 
                         if stream_task and not stream_task.done():
                             stream_task.cancel()
 
-                        if with_audio:
-                            stream_task = asyncio.create_task(
-                                dvr_server.stream_video_with_audio(ws, channel, timestamp, speed)
-                            )
-                        else:
-                            stream_task = asyncio.create_task(
-                                dvr_server.stream_video(ws, channel, timestamp, speed)
-                            )
-                        print(f"[WS] Seek: ts={timestamp}, audio={with_audio}")
+                        stream_task = asyncio.create_task(
+                            dvr_server.stream_video_with_audio(ws, channel, timestamp, speed)
+                        )
+                        print(f"[WS] Seek: ts={timestamp}")
 
                     elif action == 'speed':
                         speed = data.get('rate', 1.0)
