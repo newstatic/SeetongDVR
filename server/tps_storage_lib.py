@@ -1,113 +1,142 @@
 #!/usr/bin/env python3
 """
-tpsrecordLib.dll Python 实现
-基于逆向工程分析的完整功能复现
+天视通 (Seetong) DVR TPS 文件存储库
 
-该模块提供与原生 DLL 相同的 API 接口，用于读取和管理天视通 DVR 的 TPS 录像文件。
+统一管理所有 TPS 文件格式解析和视频数据处理算法：
+1. TIndex00.tps 主索引解析
+2. TRec*.tps 录像文件的帧索引解析（文件末尾）
+3. NAL 单元解析和视频流读取
+4. VPS 扫描和时间计算
 
-文件格式:
-  - TIndex00.tps: 主索引文件
-  - TRec{N:06d}.tps: 视频录像文件 (纯 H.265/HEVC)
-
-作者: 逆向分析自 tpsrecordLib.dll
+文件结构:
+- TIndex00.tps: 主索引文件，包含段落索引和帧索引
+- TRec{N:06d}.tps: 录像文件，每个 256MB
+  - 数据区域: 0x00000000 - 0x0F900000 (视频/音频数据)
+  - 索引区域: 0x0F900000 - 0x10000000 (帧索引，倒序存储)
 """
 
 import struct
-import os
-import threading
-import time
+import hashlib
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from dataclasses import dataclass, field
-from typing import List, Optional, Callable, Dict, Tuple, BinaryIO
-from enum import IntEnum, IntFlag
-import logging
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, NamedTuple, Iterator, BinaryIO
+from enum import IntEnum
 
-# 配置日志
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("tps_storage")
+import numpy as np
 
-# 北京时区
+# ============================================================================
+# 常量定义
+# ============================================================================
+
+# 时区
 BEIJING_TZ = timezone(timedelta(hours=8))
 
-# ============================================================================
-# 常量定义 (从 DLL 逆向分析得到)
-# ============================================================================
-
-# 文件魔数
+# TIndex00.tps 常量
 TPS_INDEX_MAGIC = 0x1F2E3D4C
+SEGMENT_INDEX_OFFSET = 0x4FC
+FRAME_INDEX_OFFSET = 0x84C0
+ENTRY_SIZE = 0x40
 
-# 索引文件偏移 (从 DLL 汇编分析确认)
-SEGMENT_INDEX_OFFSET = 0x4FC      # 段落索引起始偏移
-FRAME_INDEX_OFFSET = 0x84C0       # 帧索引起始偏移 (34,000 字节)
-ENTRY_SIZE = 0x40                 # 每条记录 64 字节
+# TRec 文件常量
+TREC_FILE_SIZE = 0x10000000  # 256MB
+TREC_INDEX_REGION_START = 0x0F900000  # 索引区域起始
+TREC_FRAME_INDEX_MAGIC = 0x4C3D2E1F
+TREC_FRAME_INDEX_SIZE = 44
 
-# DLL 分析得到的限制常量
-MAX_SEGMENT_COUNT = 0xB9E         # 最大段落数 2974
-MAX_FRAME_INDEX_COUNT = 0x7B40    # 最大帧索引数 31552
-TREC_FILE_SIZE = 0x10000000       # TRec 文件大小 256MB
-
-# 错误码 (从 DLL 字符串分析)
-class TPSError(IntEnum):
-    SUCCESS = 0
-    NOT_INITIALIZED = 0xC000010D
-    INVALID_PARAM = 0xC0000103
-    INVALID_HANDLE = 0xC0000105
-    SEEK_ERROR = 0xC0000106
-    READ_ERROR = 0xC0000107
-    FILE_NOT_FOUND = 0xC0000108
+# 通道定义
+CHANNEL_VIDEO_CH1 = 2
+CHANNEL_AUDIO = 3
+CHANNEL_VIDEO_CH2 = 258
+VALID_CHANNELS = (CHANNEL_VIDEO_CH1, CHANNEL_AUDIO, CHANNEL_VIDEO_CH2)
 
 # 帧类型
-class FrameType(IntEnum):
-    VIDEO_I = 0x01  # I 帧
-    VIDEO_P = 0x02  # P 帧
-    VIDEO_B = 0x03  # B 帧
-    AUDIO = 0x10    # 音频帧
+FRAME_TYPE_I = 1
+FRAME_TYPE_P = 3
 
-# 事件类型
-class EventType(IntFlag):
-    NONE = 0x00
-    MOTION = 0x01
-    ALARM = 0x02
-    SCHEDULE = 0x04
-    MANUAL = 0x08
+# 有效时间戳下限：2020-01-01
+MIN_VALID_TIMESTAMP = 1577836800
+
+
+# ============================================================================
+# NAL 类型定义
+# ============================================================================
+
+class NalType(IntEnum):
+    """H.265/HEVC NAL 单元类型"""
+    TRAIL_N = 0      # P帧 (非参考)
+    TRAIL_R = 1      # P帧 (参考)
+    IDR_W_RADL = 19  # IDR 帧
+    IDR_N_LP = 20    # IDR 帧
+    VPS = 32         # 视频参数集
+    SPS = 33         # 序列参数集
+    PPS = 34         # 图像参数集
+
+    @classmethod
+    def name(cls, value: int) -> str:
+        """获取 NAL 类型名称"""
+        names = {
+            0: "TRAIL_N", 1: "TRAIL_R",
+            19: "IDR_W_RADL", 20: "IDR_N_LP",
+            32: "VPS", 33: "SPS", 34: "PPS",
+        }
+        return names.get(value, f"NAL_{value}")
+
+    @classmethod
+    def is_video_frame(cls, nal_type: int) -> bool:
+        """判断是否为视频帧 NAL"""
+        return nal_type in (cls.TRAIL_N, cls.TRAIL_R, cls.IDR_W_RADL, cls.IDR_N_LP)
+
+    @classmethod
+    def is_keyframe(cls, nal_type: int) -> bool:
+        """判断是否为关键帧"""
+        return nal_type in (cls.IDR_W_RADL, cls.IDR_N_LP)
+
+    @classmethod
+    def is_header(cls, nal_type: int) -> bool:
+        """判断是否为头部 NAL (VPS/SPS/PPS)"""
+        return nal_type in (cls.VPS, cls.SPS, cls.PPS)
+
+
+# NAL 起始码
+NAL_START_CODE_4 = b'\x00\x00\x00\x01'
+NAL_START_CODE_3 = b'\x00\x00\x01'
+
+# VPS 搜索模式 (00 00 00 01 40)
+VPS_PATTERN = b'\x00\x00\x00\x01\x40'
 
 
 # ============================================================================
 # 数据结构定义
 # ============================================================================
 
-@dataclass
-class FileIndexHeader:
+class FrameIndexRecord(NamedTuple):
+    """TRec 文件中的帧索引记录（文件末尾索引区域）
+
+    每条记录 44 字节，按时间倒序存储
+    用于精确定位音视频帧
     """
-    TIndex00.tps 文件头结构
-    偏移 0x00, 大小 32 字节
-    """
-    iFileStartCode: int      # 0x00: 魔数 0x1F2E3D4C
-    iModifyTimes: int        # 0x04: 64位修改时间戳
-    iVersion: int            # 0x0C: 版本号
-    iAVFiles: int            # 0x10: 录像文件数量
-    iCurrFileRecNo: int      # 0x14: 当前录像文件编号
-    iCrcSum: int             # 0x18: CRC校验和
+    frame_type: int      # 1=I帧, 3=P帧/音频
+    channel: int         # 2=Video CH1, 3=Audio, 258=Video CH2
+    frame_seq: int       # 帧序号
+    file_offset: int     # 数据区域内的偏移
+    frame_size: int      # 帧数据大小
+    timestamp_us: int    # 设备单调时钟（微秒级）
+    unix_ts: int         # Unix时间戳（秒）
 
 
 @dataclass
-class SegmentIndexRecord:
-    """
-    段落索引记录
-    偏移 0x4FC 开始, 每条 64 字节
+class SegmentRecord:
+    """段落索引记录（TIndex00.tps 中）
 
-    重要发现: 段落索引的序号 = TRec 文件编号
+    段落索引的序号 = TRec 文件编号
     例如: 段落 #0 对应 TRec000000.tps
-          段落 #14 对应 TRec000014.tps
     """
-    iFrameStartOffset: int   # 0x00: 帧索引块内的起始索引
-    channel: int             # 0x04: 通道号
-    flags: int               # 0x05: 标志位
-    iInfoCount: int          # 0x06: I帧/VPS 数量
-    start_time: int          # 0x08: 开始时间 (Unix秒)
-    end_time: int            # 0x0C: 结束时间 (Unix秒)
-    file_index: int = 0      # 段落序号 = TRec 文件编号
-    # 0x10-0x3F: 保留
+    file_index: int      # TRec 文件编号
+    channel: int         # 通道号
+    start_time: int      # 开始时间 (Unix秒)
+    end_time: int        # 结束时间 (Unix秒)
+    frame_count: int     # I帧/VPS 数量
 
     @property
     def start_datetime(self) -> datetime:
@@ -123,1150 +152,307 @@ class SegmentIndexRecord:
 
 
 @dataclass
-class FrameIndexRecord:
-    """
-    帧索引记录 (61秒粒度)
-    偏移 0x84C0 开始, 每条 64 字节
-    """
-    type_1: int              # 0x00: 类型标识 (常量 1)
-    type_2: int              # 0x04: 类型标识 (常量 1)
-    start_time: int          # 0x08: GOP 开始时间
-    end_time: int            # 0x0C: GOP 结束时间
-    file_start_offset: int   # 0x10: 视频文件起始偏移
-    file_end_offset: int     # 0x14: 视频文件结束偏移
-    frame_count: int         # 0x18: 帧数
-    flags: int               # 0x1A: 标志
-    size_or_flags: int       # 0x1C: 大小或标志
-    gop_index: int           # 0x20: GOP 序号
-    # 0x24-0x3B: 保留
-    checksum: int            # 0x3C: 校验和
-
-    @property
-    def start_datetime(self) -> datetime:
-        return datetime.fromtimestamp(self.start_time, tz=BEIJING_TZ)
-
-    @property
-    def end_datetime(self) -> datetime:
-        return datetime.fromtimestamp(self.end_time, tz=BEIJING_TZ)
-
-    @property
-    def duration_seconds(self) -> int:
-        return self.end_time - self.start_time
-
-    @property
-    def data_size(self) -> int:
-        return self.file_end_offset - self.file_start_offset
+class NalUnit:
+    """NAL 单元信息"""
+    offset: int      # 在数据中的偏移（包含起始码）
+    size: int        # 总大小（包含起始码）
+    nal_type: int    # NAL 类型
+    data: bytes = None  # NAL 数据（不含起始码），可选
 
 
 @dataclass
-class DataFrameInfo:
-    """
-    数据帧信息 (回调中使用)
-    从 DLL 日志字符串推断的结构
-    """
-    code: int                # 帧类型码
-    type: int                # 类型 (视频/音频)
-    frameType: int           # 帧子类型 (I/P)
-    subType: int             # 子类型
-    No: int                  # 帧序号
-    offset: int              # 文件偏移
-    length: int              # 帧长度
-    time: int                # 时间戳 (rTime, 毫秒)
-    iCrcSum: int             # CRC
-
-
-@dataclass
-class TimeSegment:
-    """时间段信息 (用于查询结果)"""
-    start_time: int
-    end_time: int
-    event_type: int
-    file_index: int
-    segment_index: int
-
-
-@dataclass
-class PlaybackHandle:
-    """播放器句柄"""
-    handle_id: int
-    start_time: int
-    end_time: int
-    current_time: int
-    is_paused: bool = False
-    is_running: bool = True
-    callback: Optional[Callable] = None
-    file_index: int = 0
-    segment_index: int = 0
-    frame_offset: int = 0
+class VideoStreamState:
+    """视频流读取状态"""
+    file_handle: BinaryIO
+    stream_pos: int          # 当前读取位置
+    buffer: bytearray        # 读取缓冲区
+    current_time_ms: int     # 当前时间戳（毫秒）
+    frame_count: int = 0     # 已发送帧数
+    vps: bytes = None        # 缓存的 VPS
+    sps: bytes = None        # 缓存的 SPS
+    pps: bytes = None        # 缓存的 PPS
 
 
 # ============================================================================
-# 全局状态 (模拟 DLL 中的全局变量)
+# 索引缓存
 # ============================================================================
 
-@dataclass
-class GlobalState:
-    """全局状态管理器"""
-    is_initialized: bool = False
-    storage_path: str = ""
-    max_av_files: int = 256
-
-    # 索引数据
-    file_header: Optional[FileIndexHeader] = None
-    segment_records: List[SegmentIndexRecord] = field(default_factory=list)
-    frame_records: List[FrameIndexRecord] = field(default_factory=list)
-
-    # 播放器句柄
-    playback_handles: Dict[int, PlaybackHandle] = field(default_factory=dict)
-    next_handle_id: int = 1
-
-    # 同步锁
-    mutex: threading.Lock = field(default_factory=threading.Lock)
-
-    # 日志回调
-    log_callback: Optional[Callable] = None
-    log_level: int = 1
+# NumPy 结构化数组的 dtype
+RECORD_DTYPE = np.dtype([
+    ('frame_type', 'u4'),
+    ('channel', 'u4'),
+    ('frame_seq', 'u4'),
+    ('file_offset', 'u4'),
+    ('frame_size', 'u4'),
+    ('timestamp_us', 'u8'),
+    ('unix_ts', 'u4'),
+])
 
 
-# 全局单例
-_global_state = GlobalState()
+class IndexCache:
+    """帧索引缓存管理器
 
-
-# ============================================================================
-# 日志函数实现
-# ============================================================================
-
-def TSDK_SetLogLevel(level: int) -> None:
+    使用 NumPy 存储，加载速度比纯 Python 快 10 倍以上
     """
-    设置日志级别
 
-    对应 DLL 导出: TSDK_SetLogLevel
-    RVA: 0x15A0
+    def __init__(self, cache_dir: Path = None):
+        if cache_dir is None:
+            cache_dir = Path(__file__).parent.parent / '.index_cache'
+        self.cache_dir = cache_dir
+        self.cache_dir.mkdir(exist_ok=True)
 
-    Args:
-        level: 日志级别 (0=关闭, 1=错误, 2=警告, 3=信息, 4=调试)
-    """
-    _global_state.log_level = level
-    logger.setLevel([logging.CRITICAL, logging.ERROR, logging.WARNING,
-                     logging.INFO, logging.DEBUG][min(level, 4)])
+    def _get_file_hash(self, file_path: str) -> str:
+        """计算文件哈希（文件名 + 大小）"""
+        path = Path(file_path)
+        stat = path.stat()
+        identifier = f"{path.name}:{stat.st_size}"
+        return hashlib.md5(identifier.encode()).hexdigest()
 
+    def _get_cache_path(self, file_hash: str) -> Path:
+        return self.cache_dir / f"{file_hash}.npy"
 
-def TSDK_SetLogCb(callback: Optional[Callable[[str], None]]) -> None:
-    """
-    设置日志回调函数
+    def save(self, file_path: str, records: List[FrameIndexRecord]) -> str:
+        """保存帧索引到缓存"""
+        file_hash = self._get_file_hash(file_path)
+        cache_path = self._get_cache_path(file_hash)
 
-    对应 DLL 导出: TSDK_SetLogCb
-    RVA: 0x15B0
+        arr = np.array(
+            [(r.frame_type, r.channel, r.frame_seq, r.file_offset,
+              r.frame_size, r.timestamp_us, r.unix_ts) for r in records],
+            dtype=RECORD_DTYPE
+        )
+        np.save(cache_path, arr)
+        return file_hash
 
-    Args:
-        callback: 日志回调函数，接收日志字符串
-    """
-    _global_state.log_callback = callback
+    def load(self, file_path: str) -> Optional[List[FrameIndexRecord]]:
+        """从缓存加载帧索引"""
+        file_hash = self._get_file_hash(file_path)
+        cache_path = self._get_cache_path(file_hash)
 
+        if not cache_path.exists():
+            return None
 
-def TSDK_LogPrint(message: str) -> None:
-    """
-    输出日志
-
-    对应 DLL 导出: TSDK_LogPrint
-    RVA: 0x15C0
-
-    Args:
-        message: 日志消息
-    """
-    if _global_state.log_callback:
-        _global_state.log_callback(message)
-    else:
-        logger.info(message)
-
-
-# ============================================================================
-# 时间函数
-# ============================================================================
-
-def monotonic_us() -> int:
-    """
-    获取单调递增的微秒时间戳
-
-    对应 DLL 导出: monotonic_us
-    RVA: 0x68C0
-
-    Returns:
-        微秒级时间戳
-    """
-    return int(time.monotonic() * 1_000_000)
-
-
-# ============================================================================
-# 存储管理函数
-# ============================================================================
-
-def t_pkgstorage_Init(path: str, max_files: int = 256) -> int:
-    """
-    初始化存储系统
-
-    对应 DLL 导出: t_pkgstorage_Init@8
-    RVA: 0x6980
-    大小: 695 字节
-
-    功能:
-      1. 验证路径有效性
-      2. 初始化全局数据结构
-      3. 加载索引文件
-      4. 解析段落索引和帧索引
-
-    Args:
-        path: TPS 文件所在目录
-        max_files: 最大录像文件数
-
-    Returns:
-        0 成功, 错误码失败
-    """
-    global _global_state
-
-    TSDK_LogPrint(f"pkgstorage Init start, path: {path}")
-
-    with _global_state.mutex:
-        if _global_state.is_initialized:
-            TSDK_LogPrint("Already initialized")
-            return TPSError.SUCCESS
-
-        # 验证路径
-        if not os.path.isdir(path):
-            TSDK_LogPrint(f"Invalid path: {path}")
-            return TPSError.INVALID_PARAM
-
-        index_path = os.path.join(path, "TIndex00.tps")
-        if not os.path.exists(index_path):
-            TSDK_LogPrint(f"Index file not found: {index_path}")
-            return TPSError.FILE_NOT_FOUND
-
-        _global_state.storage_path = path
-        _global_state.max_av_files = max_files
-
-        # 加载索引
         try:
-            _load_index_file(index_path)
-        except Exception as e:
-            TSDK_LogPrint(f"Failed to load index: {e}")
-            return TPSError.READ_ERROR
-
-        _global_state.is_initialized = True
-
-        TSDK_LogPrint(f"pkgstorage Init complete, segments: {len(_global_state.segment_records)}, "
-                      f"frames: {len(_global_state.frame_records)}")
-
-        return TPSError.SUCCESS
-
-
-def _load_index_file(index_path: str) -> None:
-    """加载索引文件"""
-    with open(index_path, 'rb') as f:
-        # 读取文件头
-        f.seek(0)
-        magic = struct.unpack('<I', f.read(4))[0]
-
-        if magic != TPS_INDEX_MAGIC:
-            raise ValueError(f"Invalid magic: {magic:08X}")
-
-        f.seek(0x10)
-        av_files = struct.unpack('<I', f.read(4))[0]
-        entry_count = struct.unpack('<I', f.read(4))[0]
-
-        _global_state.file_header = FileIndexHeader(
-            iFileStartCode=magic,
-            iModifyTimes=0,
-            iVersion=0,
-            iAVFiles=av_files,
-            iCurrFileRecNo=entry_count,
-            iCrcSum=0
-        )
-
-        # 读取段落索引
-        # 重要: 段落索引的序号 = TRec 文件编号
-        _global_state.segment_records = []
-        f.seek(SEGMENT_INDEX_OFFSET)
-
-        segment_index = 0  # 段落序号，同时也是 TRec 文件编号
-        for _ in range(entry_count + 20):  # 多读一些
-            data = f.read(ENTRY_SIZE)
-            if len(data) < ENTRY_SIZE:
-                break
-
-            offset = struct.unpack('<I', data[0:4])[0]
-            channel = data[4]
-            flags = data[5]
-            frame_count = struct.unpack('<H', data[6:8])[0]
-            start_time = struct.unpack('<I', data[8:12])[0]
-            end_time = struct.unpack('<I', data[12:16])[0]
-
-            # 验证有效性
-            if channel == 0 or channel == 0xFE:
-                segment_index += 1
-                continue
-            if start_time < 1577836800 or end_time <= start_time:
-                segment_index += 1
-                continue
-
-            record = SegmentIndexRecord(
-                iFrameStartOffset=offset,
-                channel=channel,
-                flags=flags,
-                iInfoCount=frame_count,
-                start_time=start_time,
-                end_time=end_time,
-                file_index=segment_index  # 段落序号 = TRec 文件编号
-            )
-            _global_state.segment_records.append(record)
-            segment_index += 1
-
-        # 读取帧索引
-        _global_state.frame_records = []
-        f.seek(0, 2)
-        file_size = f.tell()
-
-        f.seek(FRAME_INDEX_OFFSET)
-
-        while f.tell() + ENTRY_SIZE <= file_size:
-            data = f.read(ENTRY_SIZE)
-            if len(data) < ENTRY_SIZE:
-                break
-
-            type_1, type_2 = struct.unpack('<II', data[0:8])
-            if type_1 != 1 or type_2 != 1:
-                continue
-
-            start_time = struct.unpack('<I', data[8:12])[0]
-            end_time = struct.unpack('<I', data[12:16])[0]
-            file_start = struct.unpack('<I', data[16:20])[0]
-            file_end = struct.unpack('<I', data[20:24])[0]
-            frame_count = struct.unpack('<H', data[24:26])[0]
-            flags = struct.unpack('<H', data[26:28])[0]
-            size_or_flags = struct.unpack('<I', data[28:32])[0]
-            gop_index = struct.unpack('<I', data[32:36])[0]
-            checksum = struct.unpack('<I', data[60:64])[0]
-
-            if start_time < 1577836800 or end_time <= start_time:
-                continue
-
-            record = FrameIndexRecord(
-                type_1=type_1,
-                type_2=type_2,
-                start_time=start_time,
-                end_time=end_time,
-                file_start_offset=file_start,
-                file_end_offset=file_end,
-                frame_count=frame_count,
-                flags=flags,
-                size_or_flags=size_or_flags,
-                gop_index=gop_index,
-                checksum=checksum
-            )
-            _global_state.frame_records.append(record)
-
-            if len(_global_state.frame_records) >= MAX_FRAME_INDEX_COUNT:
-                break
-
-
-def t_pkgstorage_uninit() -> int:
-    """
-    反初始化存储系统
-
-    对应 DLL 导出: t_pkgstorage_uninit@0
-    RVA: 0xA0E0
-    大小: 350 字节
-
-    功能:
-      1. 停止所有播放器
-      2. 释放资源
-      3. 重置全局状态
-
-    Returns:
-        0 成功
-    """
-    global _global_state
-
-    TSDK_LogPrint("pkgstorage uninit")
-
-    with _global_state.mutex:
-        # 停止所有播放器
-        for handle in _global_state.playback_handles.values():
-            handle.is_running = False
-
-        _global_state.playback_handles.clear()
-        _global_state.segment_records.clear()
-        _global_state.frame_records.clear()
-        _global_state.file_header = None
-        _global_state.is_initialized = False
-        _global_state.storage_path = ""
-
-    return TPSError.SUCCESS
-
-
-def t_pkgstorage_format(path: str) -> int:
-    """
-    格式化存储
-
-    对应 DLL 导出: t_pkgstorage_format@4
-    RVA: 0x7570
-    大小: 330 字节
-
-    警告: 此函数会删除所有录像数据
-
-    Args:
-        path: 存储路径
-
-    Returns:
-        0 成功
-    """
-    TSDK_LogPrint(f"pkgstorage format: {path}")
-    # 实际实现会删除所有 TRec*.tps 和重置 TIndex00.tps
-    # 这里仅作为接口定义
-    return TPSError.SUCCESS
-
-
-def t_pkgstorage_check_data_multiChannel() -> int:
-    """
-    检查多通道数据
-
-    对应 DLL 导出: t_pkgstorage_check_data_multiChannel
-    RVA: 0x6900
-    大小: 107 字节
-
-    Returns:
-        通道数
-    """
-    if not _global_state.is_initialized:
-        return 0
-
-    channels = set(r.channel for r in _global_state.segment_records)
-    return len(channels)
-
-
-def t_pkgstorage_pause() -> int:
-    """
-    暂停存储
-
-    对应 DLL 导出: t_pkgstorage_pause@0
-    RVA: 0x81D0
-    大小: 113 字节
-    """
-    TSDK_LogPrint("pkgstorage pause")
-    return TPSError.SUCCESS
-
-
-def t_pkgstorage_resume() -> int:
-    """
-    恢复存储
-
-    对应 DLL 导出: t_pkgstorage_resume@0
-    RVA: 0x8130
-    大小: 96 字节
-    """
-    TSDK_LogPrint("pkgstorage resume")
-    return TPSError.SUCCESS
-
-
-def t_pkgstorage_reflash() -> int:
-    """
-    刷新存储
-
-    对应 DLL 导出: t_pkgstorage_reflash@0
-    RVA: 0x82B0
-    大小: 103 字节
-    """
-    TSDK_LogPrint("pkgstorage reflash")
-    return TPSError.SUCCESS
-
-
-def t_pkgstorage_data_Input(frame_data: bytes) -> int:
-    """
-    输入数据帧 (录制用)
-
-    对应 DLL 导出: t_pkgstorage_data_Input@4
-    RVA: 0x8390
-    大小: 204 字节
-
-    Args:
-        frame_data: 帧数据
-
-    Returns:
-        0 成功
-    """
-    TSDK_LogPrint(f"pkgstorage data input: {len(frame_data)} bytes")
-    return TPSError.SUCCESS
-
-
-def t_pkgstorage_get_status(channel: int) -> Tuple[int, int, int, int]:
-    """
-    获取存储状态
-
-    对应 DLL 导出: t_pkgstorage_get_status@16
-    RVA: 0x8710
-    大小: 123 字节
-
-    Args:
-        channel: 通道号
-
-    Returns:
-        (状态, 已用空间, 总空间, 剩余时间)
-    """
-    if not _global_state.is_initialized:
-        return (0, 0, 0, 0)
-
-    return (1, 0, 0, 0)
-
-
-def t_pkgstorage_set_write_mode(mode: int) -> int:
-    """
-    设置写入模式
-
-    对应 DLL 导出: t_pkgstorage_set_write_mode@4
-    RVA: 0x8820
-    大小: 76 字节
-
-    Args:
-        mode: 写入模式
-
-    Returns:
-        0 成功
-    """
-    TSDK_LogPrint(f"pkgstorage set write mode: {mode}")
-    return TPSError.SUCCESS
-
-
-def t_pkgstorage_set_pre_record_time(seconds: int) -> int:
-    """
-    设置预录时间
-
-    对应 DLL 导出: t_pkgstorage_set_pre_record_time@4
-    RVA: 0x88B0
-    大小: 76 字节
-
-    Args:
-        seconds: 预录秒数
-
-    Returns:
-        0 成功
-    """
-    TSDK_LogPrint(f"pkgstorage set pre record time: {seconds}s")
-    return TPSError.SUCCESS
-
-
-def t_pkgstorage_start_event(event_type: int) -> int:
-    """
-    开始事件录制
-
-    对应 DLL 导出: t_pkgstorage_start_event@4
-    RVA: 0x8940
-    大小: 141 字节
-
-    Args:
-        event_type: 事件类型
-
-    Returns:
-        0 成功
-    """
-    TSDK_LogPrint(f"pkgstorage start event: {event_type:#x}")
-    return TPSError.SUCCESS
-
-
-def t_pkgstorage_stop_event(event_type: int) -> int:
-    """
-    停止事件录制
-
-    对应 DLL 导出: t_pkgstorage_stop_event@4
-    RVA: 0x8A50
-    大小: 165 字节
-
-    Args:
-        event_type: 事件类型
-
-    Returns:
-        0 成功
-    """
-    TSDK_LogPrint(f"pkgstorage stop event: {event_type:#x}")
-    return TPSError.SUCCESS
+            arr = np.load(cache_path)
+            return [FrameIndexRecord._make(row) for row in arr.tolist()]
+        except (ValueError, OSError):
+            cache_path.unlink(missing_ok=True)
+            return None
+
+    def clear(self):
+        """清除所有缓存"""
+        for f in self.cache_dir.glob('*.npy'):
+            f.unlink()
+
+
+# 全局缓存实例
+_index_cache = IndexCache()
 
 
 # ============================================================================
-# 播放器函数
+# NAL 解析算法
 # ============================================================================
 
-def t_pkgstorage_pb_query_by_month(year: int, month: int, event_type: int) -> List[int]:
-    """
-    按月查询录像日期
-
-    对应 DLL 导出: t_pkgstorage_pb_query_by_month@12
-    RVA: 0x8B80
-    大小: 844 字节
+def parse_nal_units(data: bytes) -> List[Tuple[int, int, int]]:
+    """解析数据中的所有 NAL 单元
 
     Args:
-        year: 年份
-        month: 月份 (1-12)
-        event_type: 事件类型过滤
+        data: 原始字节数据
 
     Returns:
-        有录像的日期列表 (1-31)
+        List of (offset, size, nal_type)
+        - offset: NAL 起始位置（包含起始码）
+        - size: NAL 总大小（包含起始码）
+        - nal_type: NAL 类型
     """
-    TSDK_LogPrint(f"pkgstorage query by month: {year}-{month:02d}")
-
-    if not _global_state.is_initialized:
-        return []
-
-    days_with_recording = set()
-
-    for record in _global_state.segment_records:
-        dt = record.start_datetime
-        if dt.year == year and dt.month == month:
-            days_with_recording.add(dt.day)
-
-    return sorted(days_with_recording)
-
-
-def t_pkgstorage_pb_query_by_day(year: int, month: int, day: int,
-                                  event_type: int, channel: int = 1) -> List[TimeSegment]:
-    """
-    按天查询录像时间段
-
-    对应 DLL 导出: t_pkgstorage_pb_query_by_day@28
-    RVA: 0x9100
-    大小: 1026 字节
-
-    日志字符串: "Get day query %d-%d-%d, iEvenType:%#x"
-
-    Args:
-        year: 年份 (1970-2100)
-        month: 月份 (1-12)
-        day: 日期 (1-31)
-        event_type: 事件类型
-        channel: 通道号
-
-    Returns:
-        TimeSegment 列表
-    """
-    TSDK_LogPrint(f"Get day query {year}-{month}-{day}, iEvenType:{event_type:#x}")
-
-    if not _global_state.is_initialized:
-        return []
-
-    # 验证日期范围
-    if not (1970 <= year <= 2100):
-        return []
-    if not (1 <= month <= 12):
-        return []
-    if not (1 <= day <= 31):
-        return []
-
-    # 计算当天的时间范围
-    try:
-        day_start = datetime(year, month, day, 0, 0, 0, tzinfo=BEIJING_TZ)
-        day_end = datetime(year, month, day, 23, 59, 59, tzinfo=BEIJING_TZ)
-    except ValueError:
-        return []
-
-    day_start_ts = int(day_start.timestamp())
-    day_end_ts = int(day_end.timestamp())
-
     results = []
+    pos = 0
 
-    for i, record in enumerate(_global_state.segment_records):
-        if record.channel != channel:
+    while pos < len(data) - 4:
+        # 检查 4 字节起始码
+        if data[pos:pos + 4] == NAL_START_CODE_4:
+            start = pos
+            start_len = 4
+        # 检查 3 字节起始码
+        elif data[pos:pos + 3] == NAL_START_CODE_3:
+            start = pos
+            start_len = 3
+        else:
+            pos += 1
             continue
 
-        # 检查是否与当天有交集
-        if record.end_time < day_start_ts or record.start_time > day_end_ts:
-            continue
+        # 获取 NAL 类型
+        nal_byte_pos = start + start_len
+        if nal_byte_pos >= len(data):
+            break
+        nal_type = (data[nal_byte_pos] >> 1) & 0x3F
 
-        segment = TimeSegment(
-            start_time=max(record.start_time, day_start_ts),
-            end_time=min(record.end_time, day_end_ts),
-            event_type=event_type,
-            file_index=i // 10,
-            segment_index=i
-        )
-        results.append(segment)
+        # 查找下一个起始码
+        next_pos = start + start_len
+        while next_pos < len(data) - 4:
+            if data[next_pos:next_pos + 4] == NAL_START_CODE_4:
+                break
+            if data[next_pos:next_pos + 3] == NAL_START_CODE_3:
+                break
+            next_pos += 1
+        else:
+            next_pos = len(data)
 
-    TSDK_LogPrint(f"Query result: {len(results)} segments")
+        size = next_pos - start
+        results.append((start, size, nal_type))
+        pos = next_pos
+
     return results
 
 
-def t_pkgstorage_pb_query_free_ts_arr(arr: List) -> int:
-    """
-    释放查询结果数组
-
-    对应 DLL 导出: t_pkgstorage_pb_query_free_ts_arr@4
-    RVA: 0x9840
-    大小: 73 字节
-
-    Args:
-        arr: 要释放的数组
-
-    Returns:
-        0 成功
-    """
-    # Python 自动垃圾回收，无需手动释放
-    arr.clear()
-    return TPSError.SUCCESS
+def strip_start_code(nal_data: bytes) -> bytes:
+    """去掉 NAL 起始码"""
+    if len(nal_data) >= 4 and nal_data[:4] == NAL_START_CODE_4:
+        return nal_data[4:]
+    elif len(nal_data) >= 3 and nal_data[:3] == NAL_START_CODE_3:
+        return nal_data[3:]
+    return nal_data
 
 
-def t_pkgstorage_pb_create(start_time: int, end_time: int,
-                            callback: Optional[Callable] = None,
-                            user_data: Optional[any] = None) -> Optional[PlaybackHandle]:
-    """
-    创建播放器
+def find_vps_sps_pps_idr(data: bytes) -> Optional[Tuple[bytes, bytes, bytes, bytes, int]]:
+    """在数据中查找 VPS/SPS/PPS/IDR 序列
 
-    对应 DLL 导出: t_pkgstorage_pb_create@16
-    RVA: 0x98B0
-    大小: 178 字节
-
-    日志字符串: "cbReplayCallback = %p"
+    从 VPS 开始，按顺序查找完整的视频头和第一个 IDR
 
     Args:
-        start_time: 开始时间 (Unix秒)
-        end_time: 结束时间 (Unix秒)
-        callback: 帧回调函数
-        user_data: 用户数据
+        data: 原始字节数据
 
     Returns:
-        PlaybackHandle 或 None
+        (vps, sps, pps, idr, idr_end_offset) 或 None
+        - idr_end_offset: IDR 结束位置（相对于 data 开头）
     """
-    TSDK_LogPrint(f"pkgstorage pb create: {start_time} - {end_time}")
-    TSDK_LogPrint(f"cbReplayCallback = {callback}")
+    nals = parse_nal_units(data)
 
-    if not _global_state.is_initialized:
-        return None
-
-    if end_time <= start_time:
-        if end_time == 0:
-            end_time = 0x7FFFFFFF
-        else:
-            return None
-
-    with _global_state.mutex:
-        handle_id = _global_state.next_handle_id
-        _global_state.next_handle_id += 1
-
-        handle = PlaybackHandle(
-            handle_id=handle_id,
-            start_time=start_time,
-            end_time=end_time,
-            current_time=start_time,
-            callback=callback
-        )
-
-        _global_state.playback_handles[handle_id] = handle
-
-    return handle
-
-
-def t_pkgstorage_pb_seek(handle: PlaybackHandle, seek_time: int) -> int:
-    """
-    播放器时间定位
-
-    对应 DLL 导出: t_pkgstorage_pb_seek@8
-    RVA: 0xA290
-    大小: 146 字节
-
-    日志字符串:
-      - "Pkg seek time %s(%s-%s)"
-      - "Seek ok, file:%d,seg:%d,seek:%u,time:%u-%u"
-      - "Pkg Invalid seek time %u(%u-%u)"
-
-    Args:
-        handle: 播放器句柄
-        seek_time: 目标时间 (Unix秒)
-
-    Returns:
-        0 成功, 错误码失败
-    """
-    if handle is None:
-        TSDK_LogPrint("Pkg Invalid input Exit ERR! hDataPopper = NULL")
-        return TPSError.INVALID_HANDLE
-
-    if not _global_state.is_initialized:
-        return TPSError.NOT_INITIALIZED
-
-    # 验证时间范围
-    if seek_time < handle.start_time or seek_time > handle.end_time:
-        TSDK_LogPrint(f"Pkg Invalid seek time {seek_time}({handle.start_time}-{handle.end_time})")
-        return TPSError.SEEK_ERROR
-
-    # 查找对应的帧记录
-    frame_record = None
-    for fr in _global_state.frame_records:
-        if fr.start_time <= seek_time < fr.end_time:
-            frame_record = fr
+    # 找到 VPS 的位置
+    vps_idx = -1
+    for i, (_, _, nal_type) in enumerate(nals):
+        if nal_type == NalType.VPS:
+            vps_idx = i
             break
 
-    if frame_record:
-        handle.current_time = seek_time
-        handle.frame_offset = frame_record.file_start_offset
+    if vps_idx < 0:
+        return None
 
-        # 计算文件内偏移
-        if frame_record.duration_seconds > 0:
-            progress = (seek_time - frame_record.start_time) / frame_record.duration_seconds
-            offset_in_record = int(progress * (frame_record.file_end_offset - frame_record.file_start_offset))
-            handle.frame_offset = frame_record.file_start_offset + offset_in_record
+    vps = sps = pps = idr = None
+    idr_end_offset = 0
 
-        TSDK_LogPrint(f"Seek ok, time:{seek_time}, offset:{handle.frame_offset:#x}")
-    else:
-        handle.current_time = seek_time
-        TSDK_LogPrint(f"Seek ok, time:{seek_time}, no frame record found")
+    for i in range(vps_idx, len(nals)):
+        offset, size, nal_type = nals[i]
+        nal_data = strip_start_code(data[offset:offset + size])
 
-    return TPSError.SUCCESS
+        if nal_type == NalType.VPS and vps is None:
+            vps = nal_data
+        elif nal_type == NalType.SPS and sps is None:
+            sps = nal_data
+        elif nal_type == NalType.PPS and pps is None:
+            pps = nal_data
+        elif NalType.is_keyframe(nal_type):
+            idr = nal_data
+            idr_end_offset = offset + size
+            break
 
-
-def t_pkgstorage_pb_pause(handle: PlaybackHandle) -> int:
-    """
-    暂停播放
-
-    对应 DLL 导出: t_pkgstorage_pb_pause@4
-    RVA: 0x9C20
-    大小: 134 字节
-
-    Args:
-        handle: 播放器句柄
-
-    Returns:
-        0 成功
-    """
-    if handle is None:
-        return TPSError.INVALID_HANDLE
-
-    TSDK_LogPrint(f"Pkg pause hDataPopper = {handle.handle_id:#x}")
-    handle.is_paused = True
-    return TPSError.SUCCESS
-
-
-def t_pkgstorage_pb_resume(handle: PlaybackHandle) -> int:
-    """
-    恢复播放
-
-    对应 DLL 导出: t_pkgstorage_pb_resume@4
-    RVA: 0x9DB0
-    大小: 134 字节
-
-    Args:
-        handle: 播放器句柄
-
-    Returns:
-        0 成功
-    """
-    if handle is None:
-        return TPSError.INVALID_HANDLE
-
-    TSDK_LogPrint(f"Pkg resume hDataPopper = {handle.handle_id:#x}")
-    handle.is_paused = False
-    return TPSError.SUCCESS
-
-
-def t_pkgstorage_pb_release(handle: PlaybackHandle) -> int:
-    """
-    释放播放器
-
-    对应 DLL 导出: t_pkgstorage_pb_release@4
-    RVA: 0x9F40
-    大小: 116 字节
-
-    Args:
-        handle: 播放器句柄
-
-    Returns:
-        0 成功
-    """
-    if handle is None:
-        return TPSError.INVALID_HANDLE
-
-    TSDK_LogPrint(f"Pkg release hDataPopper = {handle.handle_id:#x}")
-
-    handle.is_running = False
-
-    with _global_state.mutex:
-        if handle.handle_id in _global_state.playback_handles:
-            del _global_state.playback_handles[handle.handle_id]
-
-    return TPSError.SUCCESS
-
-
-def t_pkgstorage_pb_data_set_keyframe(handle: PlaybackHandle, enable: int) -> int:
-    """
-    设置只播放关键帧
-
-    对应 DLL 导出: t_pkgstorage_pb_data_set_keyframe@8
-    RVA: 0x9AB0
-    大小: 122 字节
-
-    Args:
-        handle: 播放器句柄
-        enable: 是否启用
-
-    Returns:
-        0 成功
-    """
-    if handle is None:
-        return TPSError.INVALID_HANDLE
-
-    TSDK_LogPrint(f"Pkg set keyframe: {enable}")
-    return TPSError.SUCCESS
-
-
-def t_pkgstorage_show_record_info(segment_index: int) -> None:
-    """
-    显示录像信息
-
-    对应 DLL 导出: t_pkgstorage_show_record_info@4
-    RVA: 0xA4A0
-    大小: 171 字节
-
-    Args:
-        segment_index: 段落索引
-    """
-    if not _global_state.is_initialized:
-        return
-
-    if 0 <= segment_index < len(_global_state.segment_records):
-        record = _global_state.segment_records[segment_index]
-        TSDK_LogPrint(f"Show info: channel:{record.channel}, "
-                      f"Time:{record.start_datetime.strftime('%Y-%m-%d %H:%M:%S')}-"
-                      f"{record.end_datetime.strftime('%H:%M:%S')}")
+    if vps and sps and pps and idr:
+        return (vps, sps, pps, idr, idr_end_offset)
+    return None
 
 
 # ============================================================================
-# 辅助函数
+# TRec 帧索引解析
 # ============================================================================
 
-def get_segment_by_time(timestamp: int) -> Optional[SegmentIndexRecord]:
-    """
-    根据时间戳获取对应的段落记录
+def parse_trec_frame_index(rec_file_path: str, use_cache: bool = True) -> List[FrameIndexRecord]:
+    """解析 TRec 文件中的帧索引
 
-    段落记录包含 file_index 字段，即 TRec 文件编号。
-    """
-    for seg in _global_state.segment_records:
-        if seg.start_time <= timestamp < seg.end_time:
-            return seg
-    return None
-
-
-def get_trec_file_path(timestamp: int, storage_path: str = None) -> Optional[str]:
-    """
-    根据时间戳获取对应的 TRec 文件路径
+    帧索引位于文件末尾的索引区域（0x0F900000 开始），按时间倒序存储
 
     Args:
-        timestamp: Unix 时间戳
-        storage_path: 存储路径（默认使用初始化时的路径）
+        rec_file_path: TRec 文件路径
+        use_cache: 是否使用缓存
 
     Returns:
-        TRec 文件完整路径，如 "/path/TRec000014.tps"
+        按时间正序排列的帧索引记录列表
     """
-    seg = get_segment_by_time(timestamp)
-    if seg is None:
-        return None
+    # 尝试从缓存加载
+    if use_cache:
+        cached = _index_cache.load(rec_file_path)
+        if cached is not None:
+            print(f"[IndexCache] 加载: {Path(rec_file_path).name} ({len(cached)} 条)")
+            return cached
 
-    path = storage_path or _global_state.storage_path
-    return os.path.join(path, f"TRec{seg.file_index:06d}.tps")
-
-
-def get_frame_record_by_time(timestamp: int) -> Optional[FrameIndexRecord]:
-    """根据时间戳获取帧记录"""
-    for fr in _global_state.frame_records:
-        if fr.start_time <= timestamp < fr.end_time:
-            return fr
-    return None
-
-
-def get_frame_record_by_offset(file_offset: int) -> Optional[FrameIndexRecord]:
-    """根据文件偏移获取帧记录"""
-    for fr in _global_state.frame_records:
-        if fr.file_start_offset <= file_offset < fr.file_end_offset:
-            return fr
-    return None
-
-
-def calculate_precise_time(file_offset: int) -> Optional[datetime]:
-    """根据文件偏移计算精确时间"""
-    fr = get_frame_record_by_offset(file_offset)
-    if fr is None:
-        return None
-
-    if fr.file_end_offset == fr.file_start_offset:
-        progress = 0
-    else:
-        progress = (file_offset - fr.file_start_offset) / (fr.file_end_offset - fr.file_start_offset)
-
-    time_offset = progress * fr.duration_seconds
-    precise_time = fr.start_time + time_offset
-
-    return datetime.fromtimestamp(precise_time, tz=BEIJING_TZ)
-
-
-def calculate_vps_precise_time(frame_record: FrameIndexRecord, vps_offset: int) -> int:
-    """
-    根据 VPS 的字节位置计算其精确时间戳
-
-    算法原理（从逆向分析得出）：
-    - file_start_offset 指向帧索引开始时刻数据写入的位置（不一定是 VPS）
-    - start_time 对应 file_start_offset 位置的帧时间
-    - VPS 可能在 file_start 之后若干字节（36KB-151KB）
-    - 通过字节位置线性插值计算 VPS 的精确时间
-
-    公式：
-        VPS_time = start_time + (vps_byte_offset / total_bytes) * duration
-
-    其中：
-        vps_byte_offset = vps_offset - file_start_offset
-        total_bytes = file_end_offset - file_start_offset
-        duration = end_time - start_time
-
-    验证结果：
-        - 65% 完全匹配（0秒误差）
-        - 90% 在 ±1秒内
-        - 平均误差 0.3 秒
-
-    Args:
-        frame_record: 帧索引记录
-        vps_offset: VPS 在文件中的绝对偏移
-
-    Returns:
-        Unix 时间戳（秒）
-    """
-    byte_offset = vps_offset - frame_record.file_start_offset
-    total_bytes = frame_record.file_end_offset - frame_record.file_start_offset
-    duration = frame_record.end_time - frame_record.start_time
-
-    if total_bytes <= 0:
-        return frame_record.start_time
-
-    time_offset = (byte_offset / total_bytes) * duration
-    return int(frame_record.start_time + time_offset)
-
-
-def find_vps_in_range(file_handle: BinaryIO, start: int, end: int) -> List[int]:
-    """
-    在文件范围内查找所有 VPS (H.265 Video Parameter Set) 位置
-
-    VPS NAL 单元标识: 00 00 00 01 40 01
-
-    Args:
-        file_handle: 已打开的文件句柄
-        start: 搜索起始偏移
-        end: 搜索结束偏移
-
-    Returns:
-        VPS 位置列表（绝对文件偏移）
-    """
-    VPS_PATTERN = bytes([0x00, 0x00, 0x00, 0x01, 0x40, 0x01])
-
-    file_handle.seek(start)
-    data = file_handle.read(end - start)
-
-    positions = []
-    pos = 0
-    while True:
-        found = data.find(VPS_PATTERN, pos)
-        if found < 0:
-            break
-        positions.append(start + found)
-        pos = found + 6
-
-    return positions
-
-
-def extract_gop_data(file_handle: BinaryIO, vps_offset: int, max_size: int = 500000) -> Optional[bytes]:
-    """
-    从 VPS 偏移处提取完整的 GOP 数据
-
-    Args:
-        file_handle: 已打开的文件句柄
-        vps_offset: VPS 起始偏移
-        max_size: 最大读取大小
-
-    Returns:
-        GOP 数据（从 VPS 到下一个 VPS 之前），如果无效返回 None
-    """
-    VPS_PATTERN = bytes([0x00, 0x00, 0x00, 0x01, 0x40, 0x01])
-
-    file_handle.seek(vps_offset)
-    data = file_handle.read(max_size)
-
-    # 验证是 VPS
-    if data[:6] != VPS_PATTERN:
-        return None
-
-    # 查找下一个 VPS
-    next_vps = data.find(VPS_PATTERN, 6)
-    if next_vps > 0:
-        return data[:next_vps]
-    else:
-        return data
-
-
-def get_frame_records_for_entry(entry_start_time: int, entry_end_time: int) -> List[FrameIndexRecord]:
-    """
-    获取指定时间范围内的所有帧记录
-
-    重要：帧记录的 file_start_offset/file_end_offset 是单个 TRec 文件内的偏移，
-    每个 TRec 文件从 0 开始。因此需要根据时间范围而非全局偏移来筛选。
-
-    Args:
-        entry_start_time: 段落开始时间
-        entry_end_time: 段落结束时间
-
-    Returns:
-        该时间范围内的帧记录列表
-    """
     records = []
-    for fr in _global_state.frame_records:
-        # 检查时间范围是否有交集
-        if fr.end_time >= entry_start_time and fr.start_time <= entry_end_time:
-            records.append(fr)
+
+    with open(rec_file_path, 'rb') as f:
+        # 搜索帧索引起始位置
+        magic_bytes = struct.pack('<I', TREC_FRAME_INDEX_MAGIC)
+        f.seek(TREC_INDEX_REGION_START)
+        data = f.read(0x700000)
+
+        idx = data.find(magic_bytes)
+        if idx == -1:
+            return records
+
+        index_start = TREC_INDEX_REGION_START + idx
+        f.seek(index_start)
+
+        while True:
+            data = f.read(TREC_FRAME_INDEX_SIZE)
+            if len(data) < TREC_FRAME_INDEX_SIZE:
+                break
+
+            magic = struct.unpack('<I', data[0:4])[0]
+            if magic != TREC_FRAME_INDEX_MAGIC:
+                break
+
+            frame_type = struct.unpack('<I', data[4:8])[0]
+            channel = struct.unpack('<I', data[8:12])[0]
+            frame_seq = struct.unpack('<I', data[12:16])[0]
+            file_offset = struct.unpack('<I', data[16:20])[0]
+            frame_size = struct.unpack('<I', data[20:24])[0]
+            timestamp_us = struct.unpack('<Q', data[24:32])[0]
+            unix_ts = struct.unpack('<I', data[32:36])[0]
+
+            if unix_ts > MIN_VALID_TIMESTAMP and channel in VALID_CHANNELS:
+                records.append(FrameIndexRecord(
+                    frame_type=frame_type,
+                    channel=channel,
+                    frame_seq=frame_seq,
+                    file_offset=file_offset,
+                    frame_size=frame_size,
+                    timestamp_us=timestamp_us,
+                    unix_ts=unix_ts,
+                ))
+
+    # 按时间正序排列
+    records.sort(key=lambda x: x.timestamp_us)
+
+    # 保存到缓存
+    if use_cache and records:
+        _index_cache.save(rec_file_path, records)
+        print(f"[IndexCache] 保存: {Path(rec_file_path).name} ({len(records)} 条)")
+
     return records
 
 
-def get_frame_record_by_offset_in_entry(
-    vps_offset: int,
-    frame_records: List[FrameIndexRecord]
-) -> Optional[FrameIndexRecord]:
-    """
-    在指定的帧记录列表中根据文件偏移查找帧记录
+# ============================================================================
+# VPS 扫描
+# ============================================================================
 
-    Args:
-        vps_offset: VPS 在 TRec 文件中的偏移
-        frame_records: 该 TRec 文件对应的帧记录列表
-
-    Returns:
-        匹配的帧记录，如果没找到返回 None
-    """
-    for fr in frame_records:
-        if fr.file_start_offset <= vps_offset < fr.file_end_offset:
-            return fr
-    return None
-
-
-def scan_vps_with_times(file_path: str, entry_start_time: int, entry_end_time: int) -> Tuple[List[int], List[int]]:
-    """
-    扫描文件中所有 VPS 位置并计算精确时间戳
-
-    这是统一的 VPS 扫描和时间计算接口，整合了:
-    - VPS 模式扫描
-    - 基于帧索引的精确时间插值
-    - 回退到简单算法的逻辑
-
-    重要：帧记录的 file_offset 是单个 TRec 文件内的偏移，不是全局偏移。
-    因此需要根据 entry 的时间范围筛选对应的帧记录。
+def scan_vps_positions(file_path: str) -> List[int]:
+    """扫描文件中所有 VPS 位置
 
     Args:
         file_path: TRec 文件路径
-        entry_start_time: 段落开始时间 (Unix秒)
-        entry_end_time: 段落结束时间 (Unix秒)
 
     Returns:
-        (vps_positions, vps_times): VPS 字节偏移列表和对应的时间戳列表
+        VPS 字节偏移列表
     """
-    VPS_PATTERN = b'\x00\x00\x00\x01\x40'
     vps_positions = []
 
-    # 分块扫描整个文件
     with open(file_path, 'rb') as f:
         chunk_size = 64 * 1024 * 1024  # 64MB
         offset = 0
@@ -1293,35 +479,11 @@ def scan_vps_with_times(file_path: str, entry_start_time: int, entry_end_time: i
             prev_tail = chunk[-overlap:] if len(chunk) >= overlap else chunk
             offset += len(chunk)
 
-        # 获取文件大小用于回退算法
-        f.seek(0, 2)
-        file_size = f.tell()
-
-    # 获取该时间范围内的帧记录
-    frame_records = get_frame_records_for_entry(entry_start_time, entry_end_time)
-
-    # 计算每个 VPS 的精确时间戳
-    entry_duration = entry_end_time - entry_start_time
-    vps_times = []
-
-    for vps_pos in vps_positions:
-        # 在该 entry 对应的帧记录中查找
-        frame_record = get_frame_record_by_offset_in_entry(vps_pos, frame_records)
-        if frame_record:
-            # 精确算法：基于帧索引的字节范围插值
-            vps_time = calculate_vps_precise_time(frame_record, vps_pos)
-        else:
-            # 回退：简单线性插值
-            progress = vps_pos / file_size if file_size > 0 else 0
-            vps_time = int(entry_start_time + progress * entry_duration)
-        vps_times.append(vps_time)
-
-    return vps_positions, vps_times
+    return vps_positions
 
 
 def find_nearest_vps(vps_times: List[int], target_time: int) -> Tuple[int, int]:
-    """
-    查找最接近目标时间的 VPS 索引
+    """查找最接近目标时间的 VPS 索引
 
     Args:
         vps_times: VPS 时间戳列表
@@ -1346,77 +508,289 @@ def find_nearest_vps(vps_times: List[int], target_time: int) -> Tuple[int, int]:
 
 
 # ============================================================================
-# 版本信息
+# TIndex00.tps 解析
 # ============================================================================
 
-# 对应 DLL 导出: szVersion_PKGSTREAM (RVA: 0xC020)
-VERSION = "tps_storage_lib Python 1.0.0 (based on tpsrecordLib.dll reverse engineering)"
+def parse_tindex(index_path: str) -> Tuple[List[SegmentRecord], int, int]:
+    """解析 TIndex00.tps 主索引文件
 
+    Args:
+        index_path: TIndex00.tps 文件路径
 
-def get_version() -> str:
-    """获取版本信息"""
-    return VERSION
+    Returns:
+        (segments, file_count, entry_count)
+    """
+    segments = []
+
+    with open(index_path, 'rb') as f:
+        # 读取文件头
+        f.seek(0)
+        magic = struct.unpack('<I', f.read(4))[0]
+        if magic != TPS_INDEX_MAGIC:
+            raise ValueError(f"Invalid magic: {magic:08X}")
+
+        f.seek(0x10)
+        file_count = struct.unpack('<I', f.read(4))[0]
+        entry_count = struct.unpack('<I', f.read(4))[0]
+
+        # 读取段落索引
+        f.seek(SEGMENT_INDEX_OFFSET)
+        segment_index = 0
+
+        for _ in range(entry_count + 20):
+            data = f.read(ENTRY_SIZE)
+            if len(data) < ENTRY_SIZE:
+                break
+
+            channel = data[4]
+            frame_count = struct.unpack('<H', data[6:8])[0]
+            start_time = struct.unpack('<I', data[8:12])[0]
+            end_time = struct.unpack('<I', data[12:16])[0]
+
+            # 过滤无效记录
+            if channel == 0 or channel == 0xFE:
+                segment_index += 1
+                continue
+            if start_time < MIN_VALID_TIMESTAMP or end_time <= start_time:
+                segment_index += 1
+                continue
+
+            segments.append(SegmentRecord(
+                file_index=segment_index,
+                channel=channel,
+                start_time=start_time,
+                end_time=end_time,
+                frame_count=frame_count,
+            ))
+            segment_index += 1
+
+    return segments, file_count, entry_count
 
 
 # ============================================================================
-# 测试代码
+# 视频流读取器
 # ============================================================================
 
-if __name__ == "__main__":
-    import sys
+class VideoStreamReader:
+    """视频流读取器
 
-    print("=" * 80)
-    print("tps_storage_lib - tpsrecordLib.dll Python 实现")
-    print("=" * 80)
-    print(f"版本: {VERSION}")
+    从指定位置连续读取 NAL 单元，支持缓冲区管理
+    """
 
-    # 测试路径
-    test_path = "/Volumes/NO NAME"
+    CHUNK_SIZE = 64 * 1024  # 64KB
+    MIN_BUFFER_SIZE = 256 * 1024  # 256KB
 
-    if len(sys.argv) > 1:
-        test_path = sys.argv[1]
+    def __init__(self, file_handle: BinaryIO, start_pos: int, start_time_ms: int):
+        self.f = file_handle
+        self.stream_pos = start_pos
+        self.buffer = bytearray()
+        self.current_time_ms = start_time_ms
+        self.frame_interval_ms = 40  # 25fps
+        self.frame_count = 0
 
-    if not os.path.exists(test_path):
-        print(f"测试路径不存在: {test_path}")
-        sys.exit(1)
+    def set_fps(self, fps: float):
+        """设置帧率"""
+        self.frame_interval_ms = int(1000 / fps)
 
-    # 初始化
-    print(f"\n初始化: {test_path}")
-    result = t_pkgstorage_Init(test_path)
-    print(f"初始化结果: {result}")
+    def _fill_buffer(self) -> bool:
+        """填充缓冲区
 
-    if result == TPSError.SUCCESS:
-        # 检查通道
-        channels = t_pkgstorage_check_data_multiChannel()
-        print(f"通道数: {channels}")
+        Returns:
+            False 如果文件结束
+        """
+        if len(self.buffer) >= self.MIN_BUFFER_SIZE:
+            return True
 
-        # 查询月份
-        days = t_pkgstorage_pb_query_by_month(2026, 1, 0)
-        print(f"2026-01 有录像的日期: {days}")
+        self.f.seek(self.stream_pos)
+        chunk = self.f.read(self.CHUNK_SIZE)
+        if not chunk:
+            return False
 
-        # 查询某天
-        segments = t_pkgstorage_pb_query_by_day(2026, 1, 1, 0)
-        print(f"2026-01-01 录像段落数: {len(segments)}")
+        self.buffer.extend(chunk)
+        self.stream_pos += len(chunk)
+        return True
 
-        if segments:
-            seg = segments[0]
-            print(f"  第一段: {datetime.fromtimestamp(seg.start_time, tz=BEIJING_TZ)} - "
-                  f"{datetime.fromtimestamp(seg.end_time, tz=BEIJING_TZ)}")
+    def read_next_nals(self) -> Iterator[Tuple[bytes, int, int]]:
+        """读取下一批 NAL 单元
 
-        # 创建播放器
-        if segments:
-            handle = t_pkgstorage_pb_create(segments[0].start_time, segments[0].end_time)
-            if handle:
-                print(f"\n创建播放器成功: handle={handle.handle_id}")
+        Yields:
+            (nal_data, nal_type, timestamp_ms)
+            - nal_data: NAL 数据（不含起始码）
+            - nal_type: NAL 类型
+            - timestamp_ms: 时间戳
+        """
+        if not self._fill_buffer():
+            return
 
-                # 测试 seek
-                seek_time = segments[0].start_time + 3600  # 1小时后
-                result = t_pkgstorage_pb_seek(handle, seek_time)
-                print(f"Seek 结果: {result}")
+        nal_units = parse_nal_units(bytes(self.buffer))
+        if len(nal_units) <= 1:
+            return
 
-                # 释放
-                t_pkgstorage_pb_release(handle)
+        # 发送除最后一个之外的所有 NAL（最后一个可能不完整）
+        for offset, size, nal_type in nal_units[:-1]:
+            nal_data = strip_start_code(bytes(self.buffer[offset:offset + size]))
 
-        # 反初始化
-        t_pkgstorage_uninit()
-        print("\n反初始化完成")
+            yield (nal_data, nal_type, self.current_time_ms)
+
+            # 视频帧更新时间戳
+            if NalType.is_video_frame(nal_type):
+                self.frame_count += 1
+                self.current_time_ms += self.frame_interval_ms
+
+        # 移除已处理的数据
+        last_nal_end = nal_units[-2][0] + nal_units[-2][1]
+        self.buffer = self.buffer[last_nal_end:]
+
+
+# ============================================================================
+# 统一存储管理器
+# ============================================================================
+
+class TPSStorage:
+    """TPS 存储管理器
+
+    统一管理索引解析、帧定位、视频流读取
+    """
+
+    def __init__(self, dvr_path: str):
+        self.dvr_path = Path(dvr_path)
+        self.segments: List[SegmentRecord] = []
+        self.file_count = 0
+        self.entry_count = 0
+        self._frame_index_cache: dict = {}
+        self._vps_cache: dict = {}
+        self.loaded = False
+
+    def load(self) -> bool:
+        """加载主索引"""
+        index_path = self.dvr_path / "TIndex00.tps"
+        if not index_path.exists():
+            print(f"索引文件不存在: {index_path}")
+            return False
+
+        try:
+            self.segments, self.file_count, self.entry_count = parse_tindex(str(index_path))
+            self.loaded = True
+            print(f"✓ 已加载 {len(self.segments)} 个段落索引")
+            return True
+        except Exception as e:
+            print(f"加载索引失败: {e}")
+            return False
+
+    def get_rec_file(self, file_index: int) -> Optional[Path]:
+        """获取录像文件路径"""
+        filepath = self.dvr_path / f"TRec{file_index:06d}.tps"
+        return filepath if filepath.exists() else None
+
+    def find_segment_by_time(self, timestamp: int, channel: int) -> Optional[SegmentRecord]:
+        """根据时间戳查找段落"""
+        for seg in self.segments:
+            if seg.channel == channel and seg.start_time <= timestamp <= seg.end_time:
+                return seg
+        return None
+
+    def get_frame_index(self, file_index: int) -> List[FrameIndexRecord]:
+        """获取帧索引（带缓存）"""
+        if file_index in self._frame_index_cache:
+            return self._frame_index_cache[file_index]
+
+        rec_file = self.get_rec_file(file_index)
+        if not rec_file:
+            return []
+
+        records = parse_trec_frame_index(str(rec_file))
+        self._frame_index_cache[file_index] = records
+        return records
+
+    def find_iframe_for_time(self, file_index: int, target_time: int, channel: int = CHANNEL_VIDEO_CH1
+                             ) -> Tuple[Optional[FrameIndexRecord], int]:
+        """查找最接近目标时间的 I 帧
+
+        Args:
+            file_index: TRec 文件编号
+            target_time: 目标时间戳（秒）
+            channel: 通道号
+
+        Returns:
+            (frame_record, frame_index) 或 (None, -1)
+        """
+        frame_index = self.get_frame_index(file_index)
+        if not frame_index:
+            return None, -1
+
+        # 过滤视频帧
+        video_frames = [f for f in frame_index if f.channel == channel]
+        if not video_frames:
+            return None, -1
+
+        # 找到目标时间附近的 I 帧
+        for i, vf in enumerate(video_frames):
+            if vf.unix_ts >= target_time:
+                # 向前查找最近的 I 帧
+                for j in range(i, -1, -1):
+                    if video_frames[j].frame_type == FRAME_TYPE_I:
+                        return video_frames[j], j
+                return video_frames[max(0, i - 1)], max(0, i - 1)
+
+        return None, -1
+
+    def read_video_header(self, file_index: int, iframe_offset: int
+                          ) -> Optional[Tuple[bytes, bytes, bytes, bytes, int]]:
+        """从 I 帧位置读取视频头（VPS/SPS/PPS/IDR）
+
+        I 帧索引的 offset 可能不是 VPS 起始位置，需要在 512KB 范围内搜索
+
+        Args:
+            file_index: TRec 文件编号
+            iframe_offset: I 帧的文件偏移
+
+        Returns:
+            (vps, sps, pps, idr, stream_start_pos) 或 None
+            - stream_start_pos: IDR 结束后的绝对文件位置，用于继续读取 P 帧
+        """
+        rec_file = self.get_rec_file(file_index)
+        if not rec_file:
+            return None
+
+        with open(rec_file, 'rb') as f:
+            f.seek(iframe_offset)
+            data = f.read(512 * 1024)  # 读取 512KB
+
+            result = find_vps_sps_pps_idr(data)
+            if result:
+                vps, sps, pps, idr, idr_end_offset = result
+                stream_start_pos = iframe_offset + idr_end_offset
+                return (vps, sps, pps, idr, stream_start_pos)
+
+        return None
+
+    def create_stream_reader(self, file_index: int, stream_pos: int, start_time_ms: int
+                             ) -> Optional[VideoStreamReader]:
+        """创建视频流读取器
+
+        Args:
+            file_index: TRec 文件编号
+            stream_pos: 开始读取的文件位置
+            start_time_ms: 开始时间戳（毫秒）
+
+        Returns:
+            VideoStreamReader 或 None
+        """
+        rec_file = self.get_rec_file(file_index)
+        if not rec_file:
+            return None
+
+        f = open(rec_file, 'rb')
+        return VideoStreamReader(f, stream_pos, start_time_ms)
+
+
+# ============================================================================
+# 便捷函数
+# ============================================================================
+
+def create_storage(dvr_path: str) -> Optional[TPSStorage]:
+    """创建并加载 TPS 存储管理器"""
+    storage = TPSStorage(dvr_path)
+    if storage.load():
+        return storage
+    return None
