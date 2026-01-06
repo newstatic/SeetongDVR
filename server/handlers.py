@@ -18,6 +18,23 @@ from .dvr_server import DVRServer
 dvr_server: Optional[DVRServer] = None
 current_timezone = DEFAULT_TIMEZONE
 
+# 路径历史记录（最多保留 10 个）
+storage_path_history: list[str] = []
+MAX_PATH_HISTORY = 10
+
+
+def add_to_path_history(path: str):
+    """添加路径到历史记录"""
+    global storage_path_history
+    # 移除重复项
+    if path in storage_path_history:
+        storage_path_history.remove(path)
+    # 添加到开头
+    storage_path_history.insert(0, path)
+    # 限制数量
+    if len(storage_path_history) > MAX_PATH_HISTORY:
+        storage_path_history = storage_path_history[:MAX_PATH_HISTORY]
+
 
 def set_dvr_server(server: DVRServer):
     """设置全局 DVR 服务器实例"""
@@ -71,6 +88,7 @@ async def handle_get_config(request: web.Request) -> web.Response:
         "storagePath": str(dvr_server.dvr_path) if dvr_server else "",
         "loaded": dvr_server.loaded if dvr_server else False,
         "timezone": current_timezone,
+        "pathHistory": storage_path_history,  # 返回路径历史
     }
     if dvr_server and dvr_server.loaded and dvr_server.storage:
         result["entryCount"] = len(dvr_server.storage.segments)
@@ -108,6 +126,8 @@ async def handle_set_config(request: web.Request) -> web.Response:
             new_server = DVRServer(new_path)
             if new_server.load():
                 dvr_server = new_server
+                # 添加到路径历史
+                add_to_path_history(new_path)
                 # 标记为正在构建
                 dvr_server._cache_building = True
                 dvr_server._cache_total = len(dvr_server.storage.segments)
@@ -119,6 +139,7 @@ async def handle_set_config(request: web.Request) -> web.Response:
                     "entryCount": len(dvr_server.storage.segments),
                     "fileCount": len(list(dvr_server.dvr_path.glob('TRec*.tps'))),
                     "cacheStatus": dvr_server.get_cache_status(),
+                    "pathHistory": storage_path_history,  # 返回更新后的历史
                 })
                 # 在后台线程中构建 VPS 缓存
                 loop = asyncio.get_event_loop()

@@ -35,12 +35,6 @@ class DVRServer:
         self.storage: Optional[TPSStorage] = None
         self.loaded = False
 
-        # 缓存构建状态
-        self._cache_building = False
-        self._cache_progress = 0
-        self._cache_total = 0
-        self._cache_current = 0
-
     def load(self) -> bool:
         """加载 DVR 数据"""
         self.storage = TPSStorage(str(self.dvr_path))
@@ -52,45 +46,30 @@ class DVRServer:
         return True
 
     def build_vps_cache(self):
-        """构建帧索引缓存（同步，启动时调用）"""
+        """构建帧索引和 VPS 缓存（同步，启动时调用）"""
         if not self.loaded:
             return
 
         segments = self.storage.segments
         if TEST_MODE:
-            segments = segments[:1]
-            print(f"[VPS Cache] TEST_MODE 启用，只处理第一个文件")
+            file_indices = [segments[0].file_index] if segments else []
+            print(f"[Cache] TEST_MODE 启用，只处理第一个文件")
+        else:
+            file_indices = [seg.file_index for seg in segments]
 
-        total = len(segments)
-        self._cache_building = True
-        self._cache_total = total
-        self._cache_current = 0
-        self._cache_progress = 0
-
-        print(f"[VPS Cache] 开始构建帧索引缓存，共 {total} 个文件...")
+        print(f"[Cache] 开始构建缓存，共 {len(file_indices)} 个文件...")
 
         start_time = time.time()
-        cached_count = 0
 
-        for i, seg in enumerate(segments):
-            file_index = seg.file_index
-            # 预加载帧索引（会自动缓存）
-            records = self.storage.get_frame_index(file_index)
-            if records:
-                cached_count += 1
-
-            self._cache_current = i + 1
-            self._cache_progress = int((i + 1) / total * 100)
-
-            if (i + 1) % 10 == 0 or i + 1 == total:
+        def progress_callback(current, total, file_index):
+            if current % 10 == 0 or current == total:
                 elapsed = time.time() - start_time
-                print(f"[VPS Cache] 进度: {i + 1}/{total} ({elapsed:.1f}s)")
+                print(f"[Cache] 进度: {current}/{total} ({elapsed:.1f}s)")
 
-        self._cache_building = False
-        self._cache_progress = 100
+        cached_count = self.storage.build_cache(file_indices, progress_callback)
 
         elapsed = time.time() - start_time
-        print(f"[VPS Cache] ✓ 缓存完成: {cached_count} 个文件，耗时 {elapsed:.1f}s")
+        print(f"[Cache] ✓ 缓存完成: {cached_count} 个文件，耗时 {elapsed:.1f}s")
 
     def get_cache_status(self) -> dict:
         """获取缓存构建状态"""
@@ -104,34 +83,35 @@ class DVRServer:
                 "test_mode": TEST_MODE,
             }
 
-        if self._cache_building:
+        # 使用 storage 的缓存状态
+        cache_status = self.storage.get_cache_status()
+
+        if cache_status["building"]:
             return {
                 "status": "building",
-                "progress": self._cache_progress,
-                "total": self._cache_total,
-                "current": self._cache_current,
-                "cached": len(self.storage._frame_index_cache),
+                "progress": cache_status["progress"],
+                "total": cache_status["total_segments"],
+                "current": cache_status["cached_segments"],
+                "cached": cache_status["cached_segments"],
                 "test_mode": TEST_MODE,
             }
-
-        total_entries = len(self.storage.segments)
-        processed = 1 if TEST_MODE else total_entries
 
         return {
             "status": "ready",
             "progress": 100,
-            "total": total_entries,
-            "current": processed,
-            "cached": len(self.storage._frame_index_cache),
+            "total": cache_status["total_segments"],
+            "current": cache_status["cached_segments"],
+            "cached": cache_status["cached_segments"],
             "test_mode": TEST_MODE,
         }
 
     def get_recording_dates(self, channel: Optional[int] = None, tz_name: str = "Asia/Shanghai") -> dict:
-        """获取有录像的日期列表"""
+        """获取有录像的日期列表（只返回已缓存的段落）"""
         if not self.loaded:
             return {"dates": [], "channels": []}
 
-        segments = self.storage.segments
+        # 只使用已缓存的段落
+        segments = self.storage.get_cached_segments()
         if channel is not None:
             segments = [s for s in segments if s.channel == channel]
 
@@ -147,7 +127,8 @@ class DVRServer:
             dt_end = datetime.fromtimestamp(seg.end_time, tz=tz)
             dates_set.add(dt_end.strftime("%Y-%m-%d"))
 
-        channels = sorted(set(s.channel for s in self.storage.segments))
+        # 只返回已缓存段落的通道
+        channels = sorted(set(s.channel for s in segments))
 
         return {
             "dates": sorted(dates_set),
@@ -155,7 +136,7 @@ class DVRServer:
         }
 
     def get_recordings(self, date: str, channel: Optional[int] = None, tz_name: str = "Asia/Shanghai") -> dict:
-        """获取指定日期的录像列表"""
+        """获取指定日期的录像列表（只返回已缓存的段落）"""
         if not self.loaded:
             return {"recordings": []}
 
@@ -175,8 +156,9 @@ class DVRServer:
         start_ts = int(day_start.timestamp())
         end_ts = int(day_end.timestamp())
 
+        # 只使用已缓存的段落
         recordings = []
-        for seg in self.storage.segments:
+        for seg in self.storage.get_cached_segments():
             if channel is not None and seg.channel != channel:
                 continue
 
@@ -283,18 +265,24 @@ class DVRServer:
             # 通道映射：前端 channel 1/2 -> 帧索引 channel 2/258
             frame_channel = CHANNEL_VIDEO_CH1 if channel == 1 else (258 if channel == 2 else channel)
 
-            # 2. 查找 I 帧 (seetong_lib 算法)
-            print(f"[StreamAV] DEBUG: 开始查找 I 帧, file_index={file_index}, target_time={start_timestamp}, frame_channel={frame_channel}")
-            iframe, iframe_idx = self.storage.find_iframe_for_time(file_index, start_timestamp, frame_channel)
-            print(f"[StreamAV] DEBUG: find_iframe_for_time 返回: iframe={iframe}, idx={iframe_idx}")
-            if not iframe:
-                print(f"[StreamAV] ERROR: 未找到 I 帧!")
-                await ws.send_json({"error": "未找到 I 帧"})
-                return
+            # 获取音频帧用于精确时间定位
+            audio_frames = self.storage.get_audio_frames(file_index)
 
-            # 3. 读取视频头 (seetong_lib 算法) - 先读取视频头获取实际起始位置
-            print(f"[StreamAV] DEBUG: 开始读取视频头, offset={iframe.file_offset}")
-            header_result = self.storage.read_video_header(file_index, iframe.file_offset)
+            # 2. 使用音频帧时间戳找到目标时间对应的字节偏移
+            # 这与 export_video.py 的 find_offset_for_timestamp 逻辑一致
+            target_offset = 0
+            if audio_frames:
+                for af in audio_frames:
+                    if af.unix_ts >= start_timestamp:
+                        target_offset = af.file_offset
+                        break
+                if target_offset == 0:
+                    target_offset = audio_frames[-1].file_offset
+            print(f"[StreamAV] 目标时间 {start_timestamp}, 音频帧定位偏移: {target_offset}")
+
+            # 3. 从音频帧定位的偏移搜索视频头 (VPS/SPS/PPS/IDR)
+            print(f"[StreamAV] DEBUG: 开始读取视频头, offset={target_offset}")
+            header_result = self.storage.read_video_header(file_index, target_offset)
             print(f"[StreamAV] DEBUG: read_video_header 返回: {header_result is not None}")
             if not header_result:
                 print(f"[StreamAV] ERROR: 未找到视频头!")
@@ -304,17 +292,30 @@ class DVRServer:
             vps, sps, pps, idr, stream_start_pos = header_result
             print(f"[StreamAV] DEBUG: VPS={len(vps)}, SPS={len(sps)}, PPS={len(pps)}, IDR={len(idr)}, stream_pos={stream_start_pos}")
 
-            # 使用精确时间算法计算起始时间（PRD 附录 B 算法）
-            # 注意：使用 stream_start_pos 而不是 iframe.file_offset，因为视频实际从 IDR 后开始
-            actual_start_time = self.storage.get_precise_time_for_offset(file_index, stream_start_pos, frame_channel)
+            # 使用音频帧时间戳计算精确起始时间（比字节偏移线性插值更准确）
+            # 这与 export_video.py 的 find_timestamp_for_offset 逻辑一致
+            actual_start_time = 0
+            if audio_frames:
+                for af in audio_frames:
+                    if af.file_offset <= stream_start_pos:
+                        actual_start_time = af.unix_ts
+                    else:
+                        break
             if actual_start_time == 0:
-                actual_start_time = iframe.unix_ts  # 回退到帧索引时间
-            print(f"[StreamAV] 从 I 帧 #{iframe_idx} 开始，精确时间: {actual_start_time}, unix_ts: {iframe.unix_ts}, iframe_offset: {iframe.file_offset}, stream_pos: {stream_start_pos}")
+                actual_start_time = start_timestamp  # 回退到请求时间
+            print(f"[StreamAV] 精确起始时间: {actual_start_time}, stream_pos: {stream_start_pos}")
 
-            # 获取音频帧信息
-            frame_index = self.storage.get_frame_index(file_index)
-            audio_frames = [f for f in frame_index if f.channel == CHANNEL_AUDIO]
-            print(f"[StreamAV] DEBUG: 帧索引总数={len(frame_index)}, 音频帧={len(audio_frames)}")
+            # 找到视频起始位置之后的第一个音频帧索引
+            audio_idx = 0
+            for i, af in enumerate(audio_frames):
+                if af.file_offset >= stream_start_pos:
+                    audio_idx = i
+                    break
+
+            print(f"[Audio] 总音频帧: {len(audio_frames)}, 起始索引: {audio_idx}")
+            if audio_idx < len(audio_frames):
+                print(f"[Audio] 起始音频帧: offset={audio_frames[audio_idx].file_offset}, "
+                      f"unix_ts={audio_frames[audio_idx].unix_ts}, 视频起始位置={stream_start_pos}")
 
             print(f"[StreamAV] DEBUG: 准备发送 stream_start JSON")
             await ws.send_json({
@@ -360,13 +361,8 @@ class DVRServer:
             frame_interval = 1.0 / fps
             print(f"[StreamAV] DEBUG: fps={fps}, frame_interval={frame_interval}")
 
-            # 设置音频帧起始索引
-            audio_idx = 0
-            for i, af in enumerate(audio_frames):
-                if af.unix_ts >= actual_start_time:
-                    audio_idx = i
-                    break
-            print(f"[StreamAV] DEBUG: 音频起始索引={audio_idx}")
+            # 音频同步状态
+            audio_start_time_ms = actual_start_time * 1000  # 音频时间戳的基准
 
             frame_count = 0
             total_frames_sent = 0
@@ -383,38 +379,55 @@ class DVRServer:
                         if loop_count <= 3:
                             print(f"[StreamAV] DEBUG: 循环 #{loop_count}")
 
-                        # 发送音频帧
-                        audio_sent = 0
-                        while audio_idx < len(audio_frames):
-                            af = audio_frames[audio_idx]
-                            if af.unix_ts * 1000 <= stream_reader.current_time_ms:
-                                audio_f.seek(af.file_offset)
-                                audio_data = audio_f.read(af.frame_size)
-                                await self._send_audio_frame(ws, audio_data, af.unix_ts * 1000)
-                                audio_idx += 1
-                                audio_sent += 1
-                            else:
-                                break
-                        if loop_count <= 3 and audio_sent > 0:
-                            print(f"[StreamAV] DEBUG: 发送了 {audio_sent} 个音频帧")
-
                         # 6. 使用流读取器读取 NAL 单元 (seetong_lib 算法)
                         nal_count = 0
                         if loop_count <= 3:
                             print(f"[StreamAV] DEBUG: 调用 read_next_nals(), buffer_len={len(stream_reader.buffer)}, stream_pos={stream_reader.stream_pos}")
 
-                        for nal_data, nal_type, timestamp_ms in stream_reader.read_next_nals():
+                        for nal_data, nal_type, timestamp_ms, nal_file_offset in stream_reader.read_next_nals():
                             if nal_count == 0 and loop_count <= 3:
-                                print(f"[StreamAV] DEBUG: 第一个 NAL: type={nal_type}, size={len(nal_data)}")
+                                print(f"[StreamAV] DEBUG: 第一个 NAL: type={nal_type}, size={len(nal_data)}, offset={nal_file_offset}")
 
                             if NalType.is_keyframe(nal_type):
-                                print(f"[StreamAV] 遇到新的 IDR")
+                                print(f"[StreamAV] 遇到新的 IDR @ offset={nal_file_offset}")
 
                             await self._send_frame(ws, nal_data, nal_type, timestamp_ms)
 
+                            # 每个视频帧后检查并发送音频帧
+                            # 使用 NAL 的精确文件偏移而非 stream_pos，避免批量发送
                             if NalType.is_video_frame(nal_type):
                                 frame_count += 1
                                 total_frames_sent += 1
+
+                                # 发送音频帧（基于精确的 NAL file_offset 同步）
+                                audio_sent = 0
+
+                                while audio_idx < len(audio_frames):
+                                    af = audio_frames[audio_idx]
+
+                                    # 使用 NAL 的精确偏移位置，而非缓冲区末尾位置
+                                    if af.file_offset <= nal_file_offset:
+                                        audio_f.seek(af.file_offset)
+                                        audio_data = audio_f.read(af.frame_size)
+                                        # 使用音频帧自己的时间戳（而非视频帧时间戳）
+                                        audio_ts_ms = af.unix_ts * 1000
+                                        await self._send_audio_frame(ws, audio_data, audio_ts_ms)
+
+                                        # 详细日志（减少输出）
+                                        if audio_idx % 200 == 0:
+                                            print(f"[Audio] idx={audio_idx}, offset={af.file_offset}, "
+                                                  f"nal_offset={nal_file_offset}, audio_ts={audio_ts_ms}ms, video_ts={timestamp_ms}ms")
+
+                                        audio_idx += 1
+                                        audio_sent += 1
+                                    else:
+                                        break
+
+                                # 只在批量发送时记录警告（正常应该是 0-2 个）
+                                if audio_sent > 5:
+                                    print(f"[Audio WARNING] 批量发送 {audio_sent} 个音频帧 @ 帧#{total_frames_sent}, "
+                                          f"nal_offset={nal_file_offset}")
+
                                 await asyncio.sleep(frame_interval)
 
                             nal_count += 1
@@ -429,7 +442,15 @@ class DVRServer:
                         now = time.time()
                         if now - last_log_time >= 1.0:
                             actual_fps = frame_count / (now - last_log_time)
-                            print(f"[StreamAV] FPS: {actual_fps:.1f}, 音频帧: {audio_idx}/{len(audio_frames)}, 总帧数: {total_frames_sent}")
+                            # 计算当前音视频位置差
+                            if audio_idx < len(audio_frames):
+                                next_audio_offset = audio_frames[audio_idx].file_offset
+                                offset_diff = stream_reader.stream_pos - next_audio_offset
+                            else:
+                                offset_diff = 0
+                            print(f"[StreamAV] FPS: {actual_fps:.1f}, 音频帧: {audio_idx}/{len(audio_frames)}, "
+                                  f"总帧数: {total_frames_sent}, 视频位置: {stream_reader.stream_pos}, "
+                                  f"位置差: {offset_diff}")
                             frame_count = 0
                             last_log_time = now
 

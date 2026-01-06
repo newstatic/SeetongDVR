@@ -41,6 +41,7 @@ export interface ConfigResponse {
   entryCount?: number;
   fileCount?: number;
   cacheStatus?: CacheStatus;
+  pathHistory?: string[];  // 路径历史记录
   error?: string;
 }
 

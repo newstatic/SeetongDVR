@@ -1,25 +1,40 @@
 import { useState, useEffect, useCallback } from 'react';
 import { getConfig, setStoragePath, getCacheStatus, type CacheStatus } from '../api';
+import { loadSettings } from '../stores/settings';
 
 type SetupStep = 'select_path' | 'building_cache' | 'ready';
 
 interface SetupWizardProps {
   onComplete: () => void;
+  initialPath?: string;  // 从 App 传入的初始路径
 }
 
-export function SetupWizard({ onComplete }: SetupWizardProps) {
+export function SetupWizard({ onComplete, initialPath }: SetupWizardProps) {
+  // 优先使用传入的路径，否则使用 localStorage 中保存的路径
+  const savedSettings = loadSettings();
+  const defaultPath = initialPath || savedSettings.storagePath || '/Volumes/NO NAME';
+
   const [step, setStep] = useState<SetupStep>('select_path');
-  const [storagePath, setStoragePathValue] = useState('/Volumes/NO NAME');
+  const [storagePath, setStoragePathValue] = useState(defaultPath);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [cacheStatus, setCacheStatus] = useState<CacheStatus | null>(null);
   const [initialChecking, setInitialChecking] = useState(true);
+  const [autoSubmit, setAutoSubmit] = useState(!!initialPath);  // 如果有初始路径，自动提交
 
   // 初始检查服务器状态
   useEffect(() => {
     const checkInitialState = async () => {
       try {
         const config = await getConfig();
+
+        // 如果有初始路径（从设置页面切换过来），直接使用该路径加载
+        if (initialPath) {
+          // 直接开始加载新路径
+          setInitialChecking(false);
+          return;  // 让 autoSubmit effect 处理提交
+        }
+
         if (config.loaded && config.cacheStatus) {
           setStoragePathValue(config.storagePath);
           setCacheStatus(config.cacheStatus);
@@ -43,7 +58,33 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
       }
     };
     checkInitialState();
-  }, [onComplete]);
+  }, [onComplete, initialPath]);
+
+  // 自动提交（当从设置页面切换路径时）
+  useEffect(() => {
+    if (autoSubmit && !initialChecking && storagePath) {
+      setAutoSubmit(false);
+      // 内联提交逻辑
+      const doSubmit = async () => {
+        setLoading(true);
+        setError(null);
+        try {
+          const result = await setStoragePath(storagePath.trim());
+          if (result.loaded) {
+            setCacheStatus(result.cacheStatus || null);
+            setStep('building_cache');
+          } else {
+            setError(result.error || '加载失败');
+          }
+        } catch (e) {
+          setError((e as Error).message);
+        } finally {
+          setLoading(false);
+        }
+      };
+      doSubmit();
+    }
+  }, [autoSubmit, initialChecking, storagePath]);
 
   // 轮询缓存构建进度
   useEffect(() => {

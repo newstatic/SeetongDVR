@@ -6,6 +6,7 @@ from .config import DEFAULT_DVR_PATH, DEFAULT_TIMEZONE, HOST, PORT
 from .models import StreamSession
 from .seetong_lib import (
     TPSStorage,
+    CachedSegmentInfo,
     FrameIndexRecord,
     SegmentRecord,
     NalType,
@@ -32,6 +33,7 @@ __all__ = [
     'PORT',
     'StreamSession',
     'TPSStorage',
+    'CachedSegmentInfo',
     'FrameIndexRecord',
     'SegmentRecord',
     'NalType',

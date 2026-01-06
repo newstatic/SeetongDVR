@@ -12,10 +12,10 @@ import { useWebSocket } from './hooks/useWebSocket';
 import { HEVCDecoder, type DecoderStats } from './lib/hevc-decoder';
 import { AudioPlayer } from './lib/audio-player';
 import {
+  getConfig,
   getRecordingDates,
   getRecordings,
   getStreamUrl,
-  setStoragePath,
   setTimezone,
   setTimeOffset,
   type StreamCommand,
@@ -30,6 +30,7 @@ import {
 function App() {
   // 启动向导状态
   const [setupComplete, setSetupComplete] = useState(false);
+  const [pendingStoragePath, setPendingStoragePath] = useState<string | null>(null);
 
   // 加载保存的设置
   const initialSettings = loadSettings();
@@ -58,6 +59,8 @@ function App() {
   const [timezone, setTimezoneState] = useState<TimezoneValue>(initialSettings.timezone);
   const [storagePath, setStoragePathState] = useState<string>(initialSettings.storagePath);
   const [timeOffset, setTimeOffsetState] = useState<number>(initialSettings.timeOffset);
+  const [pathHistory, setPathHistory] = useState<string[]>([]);
+  const [showPathMenu, setShowPathMenu] = useState(false);
 
   // 音频状态
   const [isMuted, setIsMuted] = useState(false);
@@ -70,6 +73,7 @@ function App() {
   const videoPlayerRef = useRef<VideoPlayerHandle>(null);
   const logIdRef = useRef(0);
   const wsRef = useRef<WebSocket | null>(null);
+  const pathMenuRef = useRef<HTMLDivElement>(null);
 
   // 录像信息
   const currentRecording = recordings.find(r =>
@@ -94,12 +98,31 @@ function App() {
     setLogs([]);
   }, []);
 
+  // 待发送命令（等待 WebSocket 连接后发送）
+  const pendingCommandRef = useRef<StreamCommand | null>(null);
+
   // 发送 WebSocket 命令
   const sendCommand = useCallback((command: StreamCommand) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+    const state = wsRef.current?.readyState;
+    const stateStr = state === WebSocket.CONNECTING ? 'CONNECTING' :
+                     state === WebSocket.OPEN ? 'OPEN' :
+                     state === WebSocket.CLOSING ? 'CLOSING' :
+                     state === WebSocket.CLOSED ? 'CLOSED' : 'NO_WS';
+
+    if (wsRef.current && state === WebSocket.OPEN) {
+      console.log(`[CMD] 发送: ${JSON.stringify(command)}`);
+      addLog(`发送命令: ${command.action}`, 'info');
       wsRef.current.send(JSON.stringify(command));
+    } else if (state === WebSocket.CONNECTING) {
+      // WebSocket 正在连接，保存命令等待连接后发送
+      console.log(`[CMD] WebSocket 连接中，命令已排队: ${JSON.stringify(command)}`);
+      addLog(`命令已排队: ${command.action}`, 'info');
+      pendingCommandRef.current = command;
+    } else {
+      console.warn(`[CMD] WebSocket 未就绪 (${stateStr}), 命令丢失: ${JSON.stringify(command)}`);
+      addLog(`命令丢失 (WS ${stateStr}): ${command.action}`, 'error');
     }
-  }, []);
+  }, [addLog]);
 
   const handleMessage = useCallback((data: ArrayBuffer) => {
     const view = new Uint8Array(data);
@@ -120,10 +143,39 @@ function App() {
     }
   }, []);
 
+  // 处理服务器 JSON 消息
+  const handleJsonMessage = useCallback((data: unknown) => {
+    const msg = data as { type?: string; [key: string]: unknown };
+    if (msg.type === 'stream_end') {
+      addLog('视频流结束', 'info');
+      // 刷新剩余音频数据
+      if (audioPlayerRef.current) {
+        audioPlayerRef.current.flush();
+      }
+      setIsPlaying(false);
+    } else if (msg.type === 'stream_start') {
+      addLog(`流开始: ${JSON.stringify(msg)}`, 'info');
+    } else if (msg.type === 'error') {
+      addLog(`服务器错误: ${msg.message || '未知错误'}`, 'error');
+    }
+  }, [addLog]);
+
+  // WebSocket 连接成功后发送排队的命令
+  const handleWsOpen = useCallback(() => {
+    if (pendingCommandRef.current && wsRef.current) {
+      console.log(`[CMD] 连接成功，发送排队命令: ${JSON.stringify(pendingCommandRef.current)}`);
+      addLog(`发送排队命令: ${pendingCommandRef.current.action}`, 'info');
+      wsRef.current.send(JSON.stringify(pendingCommandRef.current));
+      pendingCommandRef.current = null;
+    }
+  }, [addLog]);
+
   const { status, connect, disconnect } = useWebSocket({
     onMessage: handleMessage,
+    onJsonMessage: handleJsonMessage,
     onLog: addLog,
     onWebSocket: (ws) => { wsRef.current = ws; },
+    onOpen: handleWsOpen,
   });
 
   // 自动连接 WebSocket 并初始化解码器（只执行一次）
@@ -188,14 +240,25 @@ function App() {
 
     const loadDates = async () => {
       try {
-        const data = await getRecordingDates();
-        setRecordingDates(data.dates);
-        setChannels(data.channels);
-        if (data.channels.length > 0) {
-          setSelectedChannels(data.channels);
-          setCurrentChannel(data.channels[0]);
+        // 同时获取配置（包含路径历史）
+        const [datesData, configData] = await Promise.all([
+          getRecordingDates(),
+          getConfig(),
+        ]);
+
+        setRecordingDates(datesData.dates);
+        setChannels(datesData.channels);
+        if (datesData.channels.length > 0) {
+          setSelectedChannels(datesData.channels);
+          setCurrentChannel(datesData.channels[0]);
         }
-        addLog(`已加载 ${data.dates.length} 个录像日期`, 'success');
+
+        // 更新路径历史
+        if (configData.pathHistory) {
+          setPathHistory(configData.pathHistory);
+        }
+
+        addLog(`已加载 ${datesData.dates.length} 个录像日期`, 'success');
       } catch (error) {
         addLog(`加载录像日期失败: ${(error as Error).message}`, 'error');
       }
@@ -237,6 +300,8 @@ function App() {
 
   // 时间线点击 - 开始播放
   const handleTimeClick = useCallback(async (timestamp: number) => {
+    console.log(`[TimeClick] 点击时间: ${timestamp}, recordings: ${recordings.length}, selectedChannels: ${selectedChannels}`);
+    addLog(`时间线点击: ${formatTime(timestamp, timezone)}`, 'info');
     setCurrentTime(timestamp);
 
     // 找到对应的录像
@@ -245,6 +310,8 @@ function App() {
       r.startTime <= timestamp &&
       r.endTime >= timestamp
     );
+
+    console.log(`[TimeClick] 找到录像: ${recording ? `Ch${recording.channel}` : '无'}`);
 
     if (recording) {
       setCurrentChannel(recording.channel);
@@ -261,15 +328,18 @@ function App() {
         audioPlayerRef.current.reset();
       }
 
-      // 发送 seek 命令
+      // 发送 play 命令（而非 seek，确保服务器开始推流）
+      addLog(`准备发送 play 命令...`, 'info');
       sendCommand({
-        action: 'seek',
+        action: 'play',
         channel: recording.channel,
         timestamp,
         speed: playbackRate,
         audio: true,
       });
       setIsPlaying(true);
+    } else {
+      addLog(`未找到对应录像`, 'error');
     }
   }, [recordings, selectedChannels, playbackRate, sendCommand, addLog, timezone]);
 
@@ -317,8 +387,9 @@ function App() {
       audioPlayerRef.current.reset();
     }
 
+    // 使用 play 命令重新开始播放（seek 和 play 服务器处理一样）
     sendCommand({
-      action: 'seek',
+      action: 'play',
       channel: currentChannel,
       timestamp,
       speed: playbackRate,
@@ -449,32 +520,27 @@ function App() {
   }, [storagePath, selectedDate, addLog]);
 
   const handleStoragePathChange = useCallback(async (newPath: string) => {
-    addLog(`正在切换存储路径到 ${newPath}...`, 'info');
-    try {
-      const result = await setStoragePath(newPath);
-      if (result.loaded) {
-        setStoragePathState(newPath);
-        saveSettings({ timezone, storagePath: newPath, timeOffset });
-        addLog(`存储路径已更改，已加载 ${result.entryCount} 个条目`, 'success');
+    // 保存新路径到设置
+    setStoragePathState(newPath);
+    saveSettings({ timezone, storagePath: newPath, timeOffset });
 
-        // 重新加载录像日期
-        const data = await getRecordingDates();
-        setRecordingDates(data.dates);
-        setChannels(data.channels);
-        if (data.channels.length > 0) {
-          setSelectedChannels(data.channels);
-          setCurrentChannel(data.channels[0]);
-        }
-        setSelectedDate(null);
-        setRecordings([]);
-        setCurrentTime(null);
-      } else {
-        addLog(`存储路径更改失败: ${result.error}`, 'error');
-      }
-    } catch (error) {
-      addLog(`存储路径更改失败: ${(error as Error).message}`, 'error');
+    // 停止播放
+    if (isPlaying) {
+      sendCommand({ action: 'pause' });
+      setIsPlaying(false);
     }
-  }, [timezone, timeOffset, addLog]);
+
+    // 清空当前状态
+    setRecordingDates([]);
+    setChannels([]);
+    setSelectedDate(null);
+    setRecordings([]);
+    setCurrentTime(null);
+
+    // 设置待加载路径并返回到设置向导页面
+    setPendingStoragePath(newPath);
+    setSetupComplete(false);
+  }, [timezone, timeOffset, isPlaying, sendCommand]);
 
   const handleTimeOffsetChange = useCallback(async (newOffset: number) => {
     addLog(`正在设置时间偏移到 ${newOffset}秒...`, 'info');
@@ -530,9 +596,34 @@ function App() {
     checkSupport();
   }, [addLog]);
 
+  // 点击外部关闭路径菜单
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (pathMenuRef.current && !pathMenuRef.current.contains(e.target as Node)) {
+        setShowPathMenu(false);
+      }
+    };
+
+    if (showPathMenu) {
+      document.addEventListener('mousedown', handleClickOutside);
+    }
+
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [showPathMenu]);
+
   // 显示启动向导
   if (!setupComplete) {
-    return <SetupWizard onComplete={() => setSetupComplete(true)} />;
+    return (
+      <SetupWizard
+        initialPath={pendingStoragePath || undefined}
+        onComplete={() => {
+          setPendingStoragePath(null);
+          setSetupComplete(true);
+        }}
+      />
+    );
   }
 
   return (
@@ -546,7 +637,60 @@ function App() {
                 <path d="M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4h-4z" />
               </svg>
             </div>
-            <h1 className="text-lg font-semibold text-slate-200">天视通 DVR 查看器</h1>
+            <div>
+              <h1 className="text-lg font-semibold text-slate-200">天视通 DVR 查看器</h1>
+              {/* 当前路径和切换按钮 */}
+              <div className="relative" ref={pathMenuRef}>
+                <button
+                  onClick={() => setShowPathMenu(!showPathMenu)}
+                  className="flex items-center gap-1 text-xs text-slate-400 hover:text-slate-300 transition-colors"
+                  title="点击切换路径"
+                >
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                  </svg>
+                  <span className="max-w-[200px] truncate">{storagePath}</span>
+                  {pathHistory.length > 1 && (
+                    <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                    </svg>
+                  )}
+                </button>
+                {/* 路径历史下拉菜单 */}
+                {showPathMenu && pathHistory.length > 1 && (
+                  <div className="absolute top-full left-0 mt-1 bg-slate-800 rounded-lg border border-slate-700/50 shadow-xl z-50 min-w-[250px]">
+                    <div className="p-1">
+                      {pathHistory.map((path) => (
+                        <button
+                          key={path}
+                          onClick={() => {
+                            setShowPathMenu(false);
+                            if (path !== storagePath) {
+                              handleStoragePathChange(path);
+                            }
+                          }}
+                          className={`w-full text-left px-3 py-2 rounded-md text-sm transition-colors flex items-center gap-2 ${
+                            path === storagePath
+                              ? 'bg-primary-500/20 text-primary-400'
+                              : 'hover:bg-slate-700/50 text-slate-300'
+                          }`}
+                        >
+                          <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                          </svg>
+                          <span className="truncate">{path}</span>
+                          {path === storagePath && (
+                            <svg className="w-4 h-4 ml-auto text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                            </svg>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
           </div>
           <div className="flex items-center gap-2">
             <button

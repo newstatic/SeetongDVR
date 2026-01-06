@@ -340,11 +340,37 @@ class IndexCache:
         self.cache_dir.mkdir(exist_ok=True)
 
     def _get_file_hash(self, file_path: str) -> str:
-        """计算文件哈希（文件名 + 大小）"""
+        """计算文件内容哈希（读取文件头部 + 中间 + 尾部采样）
+
+        为了避免读取整个大文件，采用采样策略：
+        - 读取文件头部 64KB
+        - 读取文件中间 64KB
+        - 读取文件尾部 64KB
+        - 加上文件大小
+        """
         path = Path(file_path)
         stat = path.stat()
-        identifier = f"{path.name}:{stat.st_size}"
-        return hashlib.md5(identifier.encode()).hexdigest()
+        file_size = stat.st_size
+        sample_size = 64 * 1024  # 64KB
+
+        hasher = hashlib.md5()
+        hasher.update(str(file_size).encode())  # 包含文件大小
+
+        with open(path, 'rb') as f:
+            # 读取头部
+            hasher.update(f.read(sample_size))
+
+            # 读取中间
+            if file_size > sample_size * 3:
+                f.seek(file_size // 2)
+                hasher.update(f.read(sample_size))
+
+            # 读取尾部
+            if file_size > sample_size * 2:
+                f.seek(-sample_size, 2)
+                hasher.update(f.read(sample_size))
+
+        return hasher.hexdigest()
 
     def _get_cache_path(self, file_hash: str) -> Path:
         return self.cache_dir / f"{file_hash}.npy"
@@ -773,14 +799,15 @@ class VideoStreamReader:
         self.stream_pos += len(chunk)
         return True
 
-    def read_next_nals(self) -> Iterator[Tuple[bytes, int, int]]:
+    def read_next_nals(self) -> Iterator[Tuple[bytes, int, int, int]]:
         """读取下一批 NAL 单元
 
         Yields:
-            (nal_data, nal_type, timestamp_ms)
+            (nal_data, nal_type, timestamp_ms, nal_file_offset)
             - nal_data: NAL 数据（不含起始码）
             - nal_type: NAL 类型
             - timestamp_ms: 时间戳
+            - nal_file_offset: NAL 在文件中的精确偏移位置
         """
         # 尝试多次填充缓冲区，跳过非 NAL 数据
         max_attempts = 10
@@ -820,7 +847,7 @@ class VideoStreamReader:
         for offset, size, nal_type in nal_units[:-1]:
             nal_data = strip_start_code(bytes(self.buffer[offset:offset + size]))
 
-            # 计算此 NAL 的文件偏移
+            # 计算此 NAL 的文件偏移（精确位置，用于音频同步）
             nal_file_offset = self.buffer_start_pos + offset
 
             # 使用精确时间或帧率累加时间
@@ -829,7 +856,7 @@ class VideoStreamReader:
             else:
                 timestamp_ms = self.current_time_ms
 
-            yield (nal_data, nal_type, timestamp_ms)
+            yield (nal_data, nal_type, timestamp_ms, nal_file_offset)
 
             # 视频帧更新时间戳（用于非精确模式的回退）
             if NalType.is_video_frame(nal_type):
@@ -846,21 +873,42 @@ class VideoStreamReader:
 # 统一存储管理器
 # ============================================================================
 
+@dataclass
+class CachedSegmentInfo:
+    """已缓存段落的完整信息"""
+    segment: SegmentRecord
+    frame_index: List[FrameIndexRecord]
+    vps_positions: List[Tuple[int, int]]  # [(offset, precise_time), ...] VPS 位置及其精确时间
+    audio_frames: List[FrameIndexRecord]  # 音频帧列表（按 file_offset 排序）
+
+
 class TPSStorage:
     """TPS 存储管理器
 
-    统一管理索引解析、帧定位、视频流读取
+    统一管理索引解析、帧定位、视频流读取、缓存管理
+
+    缓存策略:
+    - segments: 所有段落索引（从 TIndex00.tps 加载）
+    - _cached_segments: 已完全缓存的段落信息（帧索引 + VPS 位置）
+    - 只有已缓存的段落才能被播放和查询
     """
 
     def __init__(self, dvr_path: str):
         self.dvr_path = Path(dvr_path)
-        self.segments: List[SegmentRecord] = []
+        self.segments: List[SegmentRecord] = []  # 所有段落索引
         self.file_count = 0
         self.entry_count = 0
-        self._frame_index_cache: dict = {}
-        self._vps_cache: dict = {}
-        self._iframe_offsets_cache: dict = {}  # 缓存 I 帧偏移列表: {(file_index, channel): [(offset, unix_ts), ...]}
+
+        # 核心缓存：已完全缓存的段落
+        self._cached_segments: dict[int, CachedSegmentInfo] = {}  # {file_index: CachedSegmentInfo}
+
         self.loaded = False
+
+        # 缓存构建状态
+        self._cache_building = False
+        self._cache_progress = 0
+        self._cache_total = 0
+        self._cache_current = 0
 
     def load(self) -> bool:
         """加载主索引"""
@@ -878,27 +926,178 @@ class TPSStorage:
             print(f"加载索引失败: {e}")
             return False
 
+    # ==================== 缓存管理 ====================
+
+    def build_cache(self, file_indices: List[int] = None, progress_callback=None) -> int:
+        """构建段落缓存
+
+        Args:
+            file_indices: 要缓存的文件索引列表，None 表示全部
+            progress_callback: 进度回调函数 (current, total, file_index)
+
+        Returns:
+            成功缓存的段落数量
+        """
+        if not self.loaded:
+            return 0
+
+        segments_to_cache = []
+        if file_indices is None:
+            segments_to_cache = self.segments
+        else:
+            for seg in self.segments:
+                if seg.file_index in file_indices:
+                    segments_to_cache.append(seg)
+
+        self._cache_building = True
+        self._cache_total = len(segments_to_cache)
+        self._cache_current = 0
+        self._cache_progress = 0
+
+        cached_count = 0
+        for i, seg in enumerate(segments_to_cache):
+            file_index = seg.file_index
+
+            try:
+                cached_info = self._build_segment_cache(seg)
+                if cached_info:
+                    self._cached_segments[file_index] = cached_info
+                    cached_count += 1
+            except Exception as e:
+                print(f"[Cache] 缓存段落 {file_index} 失败: {e}")
+
+            self._cache_current = i + 1
+            self._cache_progress = int((i + 1) / self._cache_total * 100)
+
+            if progress_callback:
+                progress_callback(i + 1, self._cache_total, file_index)
+
+        self._cache_building = False
+        self._cache_progress = 100
+
+        return cached_count
+
+    def _build_segment_cache(self, seg: SegmentRecord) -> Optional[CachedSegmentInfo]:
+        """构建单个段落的缓存"""
+        rec_file = self.get_rec_file(seg.file_index)
+        if not rec_file:
+            return None
+
+        # 1. 加载帧索引
+        frame_index = parse_trec_frame_index(str(rec_file))
+        if not frame_index:
+            return None
+
+        # 2. 提取音频帧并按 file_offset 排序（先处理音频帧，用于修正 VPS 时间）
+        audio_frames = [f for f in frame_index if f.channel == CHANNEL_AUDIO]
+        audio_frames.sort(key=lambda f: f.file_offset)
+
+        # 3. 扫描 VPS 位置并使用音频帧时间戳计算精确时间
+        vps_offsets = scan_vps_positions(str(rec_file))
+        vps_positions = []
+
+        def find_audio_time_for_offset(target_offset: int) -> int:
+            """使用音频帧索引查找偏移对应的精确时间"""
+            if not audio_frames:
+                return calculate_precise_time(seg, target_offset)
+            # 找到 offset <= target_offset 的最后一个音频帧
+            best = audio_frames[0]
+            for af in audio_frames:
+                if af.file_offset <= target_offset:
+                    best = af
+                else:
+                    break
+            return best.unix_ts
+
+        for offset in vps_offsets:
+            # 限制在数据区域内
+            if offset < TREC_INDEX_REGION_START:
+                # 使用音频帧时间戳代替线性插值计算
+                precise_time = find_audio_time_for_offset(offset)
+                vps_positions.append((offset, precise_time))
+
+        print(f"[Cache] 段落 {seg.file_index}: {len(frame_index)} 帧, {len(vps_positions)} VPS, {len(audio_frames)} 音频帧")
+
+        return CachedSegmentInfo(
+            segment=seg,
+            frame_index=frame_index,
+            vps_positions=vps_positions,
+            audio_frames=audio_frames,
+        )
+
+    def get_cache_status(self) -> dict:
+        """获取缓存状态"""
+        return {
+            "building": self._cache_building,
+            "progress": self._cache_progress,
+            "total_segments": len(self.segments),
+            "cached_segments": len(self._cached_segments),
+            "cached_file_indices": list(self._cached_segments.keys()),
+        }
+
+    def is_segment_cached(self, file_index: int) -> bool:
+        """检查段落是否已缓存"""
+        return file_index in self._cached_segments
+
+    def get_cached_segment(self, file_index: int) -> Optional[CachedSegmentInfo]:
+        """获取已缓存的段落信息"""
+        return self._cached_segments.get(file_index)
+
+    def get_cached_segments(self) -> List[SegmentRecord]:
+        """获取所有已缓存段落的列表"""
+        return [info.segment for info in self._cached_segments.values()]
+
+    def get_audio_frames(self, file_index: int) -> List[FrameIndexRecord]:
+        """获取音频帧列表（按 file_offset 排序）"""
+        cached = self._cached_segments.get(file_index)
+        if cached:
+            return cached.audio_frames
+        return []
+
+    # ==================== 基础查询 ====================
+
     def get_rec_file(self, file_index: int) -> Optional[Path]:
         """获取录像文件路径"""
         filepath = self.dvr_path / f"TRec{file_index:06d}.tps"
         return filepath if filepath.exists() else None
 
-    def find_segment_by_time(self, timestamp: int, channel: int) -> Optional[SegmentRecord]:
-        """根据时间戳查找段落"""
-        for seg in self.segments:
-            if seg.channel == channel and seg.start_time <= timestamp <= seg.end_time:
-                return seg
+    def find_segment_by_time(self, timestamp: int, channel: int, cached_only: bool = True) -> Optional[SegmentRecord]:
+        """根据时间戳查找段落
+
+        Args:
+            timestamp: 目标时间戳
+            channel: 通道号
+            cached_only: 是否只搜索已缓存的段落
+
+        Returns:
+            匹配的段落或 None
+        """
+        if cached_only:
+            for info in self._cached_segments.values():
+                seg = info.segment
+                if seg.channel == channel and seg.start_time <= timestamp <= seg.end_time:
+                    return seg
+        else:
+            for seg in self.segments:
+                if seg.channel == channel and seg.start_time <= timestamp <= seg.end_time:
+                    return seg
         return None
 
     def get_segment_by_file_index(self, file_index: int) -> Optional[SegmentRecord]:
         """根据文件索引查找段落"""
+        # 优先从缓存获取
+        if file_index in self._cached_segments:
+            return self._cached_segments[file_index].segment
+        # 回退到全部段落
         for seg in self.segments:
             if seg.file_index == file_index:
                 return seg
         return None
 
     def get_iframe_offsets(self, file_index: int, channel: int) -> List[Tuple[int, int]]:
-        """获取 I 帧偏移列表（带缓存）
+        """获取 I 帧偏移列表
+
+        优先使用 VPS 缓存（精确），回退到帧索引查找
 
         Args:
             file_index: TRec 文件编号
@@ -906,12 +1105,13 @@ class TPSStorage:
 
         Returns:
             [(offset, unix_ts), ...] 按 offset 排序
-            如果没有 frame_type=1 的帧，返回采样的帧偏移列表
         """
-        cache_key = (file_index, channel)
-        if cache_key in self._iframe_offsets_cache:
-            return self._iframe_offsets_cache[cache_key]
+        # 优先从 VPS 缓存获取（最精确）
+        cached = self._cached_segments.get(file_index)
+        if cached and cached.vps_positions:
+            return cached.vps_positions
 
+        # 回退：从帧索引提取
         frame_index = self.get_frame_index(file_index)
         video_frames = [f for f in frame_index if f.channel == channel]
 
@@ -925,28 +1125,57 @@ class TPSStorage:
                                for i in range(0, len(video_frames), sample_interval)]
 
         i_frame_offsets.sort(key=lambda x: x[0])
-
-        self._iframe_offsets_cache[cache_key] = i_frame_offsets
         return i_frame_offsets
 
     def get_frame_index(self, file_index: int) -> List[FrameIndexRecord]:
-        """获取帧索引（带缓存）"""
-        if file_index in self._frame_index_cache:
-            return self._frame_index_cache[file_index]
+        """获取帧索引
 
-        rec_file = self.get_rec_file(file_index)
-        if not rec_file:
-            return []
+        从 _cached_segments 获取，如果没有缓存则返回空列表
+        """
+        cached = self._cached_segments.get(file_index)
+        if cached:
+            return cached.frame_index
+        return []
 
-        records = parse_trec_frame_index(str(rec_file))
-        self._frame_index_cache[file_index] = records
-        return records
+    def find_vps_for_time(self, file_index: int, target_time: int) -> Optional[Tuple[int, int]]:
+        """使用 VPS 缓存查找目标时间对应的 VPS 位置
+
+        这是最精确的关键帧定位方法，直接使用扫描到的 VPS 位置
+
+        Args:
+            file_index: TRec 文件编号
+            target_time: 目标时间戳（秒）
+
+        Returns:
+            (vps_offset, precise_time) 或 None
+        """
+        cached = self._cached_segments.get(file_index)
+        if not cached or not cached.vps_positions:
+            return None
+
+        # 二分查找目标时间之前最近的 VPS
+        vps_list = cached.vps_positions
+        best_vps = None
+
+        for offset, precise_time in vps_list:
+            if precise_time <= target_time:
+                if best_vps is None or precise_time > best_vps[1]:
+                    best_vps = (offset, precise_time)
+            elif best_vps is not None:
+                # 已经过了目标时间，停止搜索
+                break
+
+        # 如果没找到之前的 VPS，使用第一个
+        if best_vps is None and vps_list:
+            best_vps = vps_list[0]
+
+        return best_vps
 
     def find_iframe_for_time(self, file_index: int, target_time: int, channel: int = CHANNEL_VIDEO_CH1
                              ) -> Tuple[Optional[FrameIndexRecord], int]:
         """查找最接近目标时间的 I 帧
 
-        使用精确时间算法：根据字节偏移插值计算每帧的精确时间
+        优先使用 VPS 缓存（精确），回退到帧索引查找
 
         Args:
             file_index: TRec 文件编号
@@ -955,113 +1184,85 @@ class TPSStorage:
 
         Returns:
             (frame_record, frame_index) 或 (None, -1)
+            注意：返回的 frame_record.file_offset 是用于 read_video_header 的起始搜索位置
         """
         print(f"[seetong_lib] find_iframe_for_time: file_index={file_index}, target_time={target_time}, channel={channel}")
 
-        # 获取段落信息（用于精确时间计算）
-        seg = self.get_segment_by_file_index(file_index)
+        # 优先使用 VPS 缓存
+        vps_result = self.find_vps_for_time(file_index, target_time)
+        if vps_result:
+            vps_offset, precise_time = vps_result
+            diff = target_time - precise_time
+            print(f"[seetong_lib] find_iframe_for_time: 使用 VPS 缓存, offset={vps_offset}, "
+                  f"precise_time={precise_time}, diff={diff}s")
 
+            # 创建一个虚拟的帧记录，用于传递 offset
+            seg = self.get_segment_by_file_index(file_index)
+            virtual_frame = FrameIndexRecord(
+                frame_type=FRAME_TYPE_I,
+                channel=channel,
+                frame_seq=0,
+                file_offset=vps_offset,
+                frame_size=0,
+                timestamp_us=0,
+                unix_ts=precise_time,
+            )
+            return virtual_frame, -1  # -1 表示使用 VPS 缓存
+
+        # 回退：使用旧的帧索引查找逻辑
+        print(f"[seetong_lib] find_iframe_for_time: VPS 缓存未命中，使用帧索引查找")
+
+        seg = self.get_segment_by_file_index(file_index)
         frame_index = self.get_frame_index(file_index)
         if not frame_index:
             print(f"[seetong_lib] find_iframe_for_time: 帧索引为空!")
             return None, -1
 
-        # 过滤视频帧
         video_frames = [f for f in frame_index if f.channel == channel]
         print(f"[seetong_lib] find_iframe_for_time: 总帧数={len(frame_index)}, 视频帧={len(video_frames)}")
         if not video_frames:
             print(f"[seetong_lib] find_iframe_for_time: 无视频帧!")
             return None, -1
 
-        # 调试：统计 frame_type 分布
-        frame_types = {}
-        for vf in video_frames[:1000]:  # 只检查前1000帧
-            ft = vf.frame_type
-            frame_types[ft] = frame_types.get(ft, 0) + 1
-        print(f"[seetong_lib] find_iframe_for_time: frame_type 分布（前1000帧）: {frame_types}")
-
-        # 检查是否有 frame_type=1 的 I 帧
-        has_iframe_type = FRAME_TYPE_I in frame_types
-
-        # 使用精确时间算法查找 I 帧
+        # 使用字节偏移估算位置
         if seg:
-            print(f"[seetong_lib] find_iframe_for_time: 使用精确时间算法, seg.start={seg.start_time}, seg.end={seg.end_time}")
+            # 计算目标时间对应的大致字节偏移
+            duration = seg.end_time - seg.start_time
+            if duration > 0:
+                time_ratio = (target_time - seg.start_time) / duration
+                target_offset = int(time_ratio * TREC_INDEX_REGION_START)
 
-            if has_iframe_type:
-                # 使用缓存的 I 帧偏移列表
-                i_frame_offsets = self.get_iframe_offsets(file_index, channel)
-                print(f"[seetong_lib] find_iframe_for_time: I 帧偏移列表长度={len(i_frame_offsets)}")
-
-                # 收集所有 I 帧及其精确时间（使用相邻 I 帧插值）
-                i_frames = []
-                for idx, vf in enumerate(video_frames):
-                    if vf.frame_type == FRAME_TYPE_I:
-                        # 使用相邻 I 帧进行精确插值
-                        precise_time = calculate_precise_time_from_iframes(i_frame_offsets, vf.file_offset, seg)
-                        i_frames.append((idx, vf, precise_time))
-            else:
-                # 没有 frame_type=1 的帧，使用简化的字节偏移时间算法
-                # 每个视频帧都可以作为起点（通过 VPS 搜索找到关键帧）
-                print(f"[seetong_lib] find_iframe_for_time: 无 frame_type=1，使用字节偏移算法")
-                i_frames = []
-                # 每隔一定数量的帧采样一个作为潜在的 I 帧位置
-                sample_interval = max(1, len(video_frames) // 100)  # 约 100 个采样点
-                for idx in range(0, len(video_frames), sample_interval):
-                    vf = video_frames[idx]
-                    precise_time = calculate_precise_time(seg, vf.file_offset)
-                    i_frames.append((idx, vf, precise_time))
-                print(f"[seetong_lib] find_iframe_for_time: 采样了 {len(i_frames)} 个帧作为潜在 I 帧")
-
-            print(f"[seetong_lib] find_iframe_for_time: 找到 {len(i_frames)} 个 I 帧")
-            if i_frames:
-                # 找到目标时间之前最近的 I 帧
-                best_iframe = None
+                # 找到最接近目标偏移的视频帧
+                best_frame = None
                 best_idx = -1
-                best_time = 0
+                best_diff = float('inf')
 
-                for idx, vf, precise_time in i_frames:
-                    if precise_time <= target_time:
-                        if best_iframe is None or precise_time > best_time:
-                            best_iframe = vf
+                for idx, vf in enumerate(video_frames):
+                    if vf.file_offset <= target_offset:
+                        diff = target_offset - vf.file_offset
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_frame = vf
                             best_idx = idx
-                            best_time = precise_time
 
-                # 如果没有找到之前的 I 帧，使用第一个
-                if best_iframe is None:
-                    best_idx, best_iframe, best_time = i_frames[0]
+                if best_frame:
+                    precise_time = calculate_precise_time(seg, best_frame.file_offset)
+                    print(f"[seetong_lib] find_iframe_for_time: 字节偏移算法找到帧 idx={best_idx}, "
+                          f"offset={best_frame.file_offset}, precise_time={precise_time}, "
+                          f"diff={target_time - precise_time}s")
+                    return best_frame, best_idx
 
-                print(f"[seetong_lib] find_iframe_for_time: 精确算法找到 I 帧 idx={best_idx}, "
-                      f"offset={best_iframe.file_offset}, precise_time={best_time}, "
-                      f"diff={target_time - best_time}s")
-                return best_iframe, best_idx
-
-        # 回退：使用 unix_ts 字段
+        # 最后回退：使用 unix_ts
         print(f"[seetong_lib] find_iframe_for_time: 使用 unix_ts 回退算法")
-        if video_frames:
-            print(f"[seetong_lib] find_iframe_for_time: 视频帧时间范围 {video_frames[0].unix_ts} - {video_frames[-1].unix_ts}")
-
         for i, vf in enumerate(video_frames):
             if vf.unix_ts >= target_time:
-                if has_iframe_type:
-                    # 从当前位置向前找最近的 I 帧
-                    for j in range(i, -1, -1):
-                        if video_frames[j].frame_type == FRAME_TYPE_I:
-                            print(f"[seetong_lib] find_iframe_for_time: 找到 I 帧 j={j}, offset={video_frames[j].file_offset}")
-                            return video_frames[j], j
-                    # 没找到之前的 I 帧，从当前位置向后找
-                    for j in range(i, len(video_frames)):
-                        if video_frames[j].frame_type == FRAME_TYPE_I:
-                            print(f"[seetong_lib] find_iframe_for_time: 向后找到 I 帧 j={j}, offset={video_frames[j].file_offset}")
-                            return video_frames[j], j
-                    # 完全没有 I 帧，返回失败
-                    print(f"[seetong_lib] find_iframe_for_time: 回退算法未找到任何 I 帧!")
-                    return None, -1
-                else:
-                    # 没有 frame_type=1，直接使用当前帧（通过 VPS 搜索找关键帧）
-                    print(f"[seetong_lib] find_iframe_for_time: 无 frame_type=1，使用帧 i={i}, offset={vf.file_offset}")
-                    return vf, i
+                return video_frames[max(0, i - 1)], max(0, i - 1)
 
-        print(f"[seetong_lib] find_iframe_for_time: 目标时间超出范围!")
+        # 返回最后一帧
+        if video_frames:
+            return video_frames[-1], len(video_frames) - 1
+
+        print(f"[seetong_lib] find_iframe_for_time: 未找到任何帧!")
         return None, -1
 
     def get_precise_time_for_offset(self, file_index: int, byte_offset: int, channel: int = CHANNEL_VIDEO_CH1) -> int:
