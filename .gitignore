@@ -64,3 +64,4 @@ tesseract_train/ground-truth/
 *.tmp
 *.temp
 .index_cache/
+audio_export/
