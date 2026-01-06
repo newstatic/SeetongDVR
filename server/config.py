@@ -2,6 +2,9 @@
 配置常量
 """
 
+# 测试模式：只加载一个 TPS 文件，加快启动速度
+TEST_MODE = True
+
 # 帧索引常量
 FRAME_INDEX_MAGIC = 0x4C3D2E1F
 FRAME_INDEX_SIZE = 44
@@ -22,7 +25,7 @@ FRAME_TYPE_P = 3
 DEFAULT_DVR_PATH = "/Volumes/NO NAME"
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 HOST = "0.0.0.0"
-PORT = 8100
+PORT = 8152
 
 # 音频配置
 AUDIO_SAMPLE_RATE = 8000

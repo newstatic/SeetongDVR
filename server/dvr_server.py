@@ -23,6 +23,7 @@ from .tps_storage_lib import (
 from .config import (
     CHANNEL_VIDEO_CH1, CHANNEL_AUDIO,
     FRAME_TYPE_I, AUDIO_SAMPLE_RATE,
+    TEST_MODE,
 )
 from .models import FrameIndexRecord
 from .frame_index import parse_frame_index
@@ -85,7 +86,12 @@ class DVRServer:
                 print(f"[VPS Cache] 警告: 初始化 tps_storage_lib 失败: {init_result}")
                 return
 
-        total = len(self.index_parser.entries)
+        entries_to_process = self.index_parser.entries
+        if TEST_MODE:
+            entries_to_process = entries_to_process[:1]
+            print(f"[VPS Cache] TEST_MODE 启用，只处理第一个文件")
+
+        total = len(entries_to_process)
         self._cache_building = True
         self._cache_total = total
         self._cache_current = 0
@@ -96,7 +102,7 @@ class DVRServer:
         start_time = time.time()
         cached_count = 0
 
-        for i, entry in enumerate(self.index_parser.entries):
+        for i, entry in enumerate(entries_to_process):
             file_index = entry.entry_index
             if file_index in self._vps_cache:
                 self._cache_current = i + 1
@@ -148,6 +154,7 @@ class DVRServer:
                 "total": 0,
                 "current": 0,
                 "cached": 0,
+                "test_mode": TEST_MODE,
             }
 
         if self._cache_building:
@@ -157,14 +164,19 @@ class DVRServer:
                 "total": self._cache_total,
                 "current": self._cache_current,
                 "cached": len(self._vps_cache),
+                "test_mode": TEST_MODE,
             }
+
+        total_entries = len(self.index_parser.entries) if self.index_parser else 0
+        processed = 1 if TEST_MODE else total_entries
 
         return {
             "status": "ready",
             "progress": 100,
-            "total": len(self.index_parser.entries) if self.index_parser else 0,
-            "current": len(self.index_parser.entries) if self.index_parser else 0,
+            "total": total_entries,
+            "current": processed,
             "cached": len(self._vps_cache),
+            "test_mode": TEST_MODE,
         }
 
     def get_recording_dates(self, channel: Optional[int] = None, tz_name: str = "Asia/Shanghai") -> dict:
@@ -368,6 +380,52 @@ class DVRServer:
             nal_data = data[offset:offset + size]
             nal_data = self._strip_start_code(nal_data)
             await self._send_frame(ws, nal_data, nal_type, timestamp_ms)
+
+    async def _send_aggregated_frame(self, ws: web.WebSocketResponse, data: bytes,
+                                      timestamp_ms: int, is_keyframe: bool):
+        """发送聚合帧 (所有 NAL 聚合为一个消息)
+
+        聚合帧格式:
+        Magic (4 bytes): 'HVCC'
+        Timestamp (8 bytes): Unix 时间戳毫秒
+        FrameType (1 byte): 0=P帧, 1=IDR
+        DataLen (4 bytes): hvcC 格式数据总长度
+        Data (N bytes): hvcC 格式数据 (每个 NAL 前有 4 字节长度)
+        """
+        nal_units = self._parse_nal_units(data)
+
+        # 构建 hvcC 格式数据 (4字节长度 + NAL数据)
+        hvcc_parts = []
+        has_idr = False
+        for offset, size, nal_type in nal_units:
+            nal_data = self._strip_start_code(data[offset:offset + size])
+            # 跳过 VPS/SPS/PPS，它们已经单独发送
+            if nal_type in (NalType.VPS, NalType.SPS, NalType.PPS):
+                continue
+            # 检测是否有 IDR NAL（真正的关键帧判断）
+            if nal_type in (NalType.IDR_W_RADL, NalType.IDR_N_LP):
+                has_idr = True
+            # 4 字节长度前缀 (大端序)
+            nal_len = len(nal_data)
+            length_prefix = struct.pack('>I', nal_len)
+            hvcc_parts.append(length_prefix + nal_data)
+
+        if not hvcc_parts:
+            return
+
+        hvcc_data = b''.join(hvcc_parts)
+        # 使用实际 NAL 类型判断关键帧，而不是索引元数据
+        frame_type = 1 if has_idr else 0
+
+        header = struct.pack(
+            '>4sQBI',
+            b'HVCC',
+            timestamp_ms,
+            frame_type,
+            len(hvcc_data)
+        )
+
+        await ws.send_bytes(header + hvcc_data)
 
     async def _send_audio_frame(self, ws: web.WebSocketResponse, audio_data: bytes,
                                  timestamp_ms: int):
@@ -612,7 +670,9 @@ class DVRServer:
                     break
 
             actual_start_time = video_frames[start_video_idx].unix_ts
+            first_iframe = video_frames[start_video_idx]
             print(f"[StreamAV] 从视频帧 #{start_video_idx} 开始，时间: {actual_start_time}")
+            print(f"[StreamAV-DEBUG] I帧索引: offset={first_iframe.file_offset} size={first_iframe.frame_size} seq={first_iframe.frame_seq}")
 
             await ws.send_json({
                 "type": "stream_start",
@@ -626,26 +686,49 @@ class DVRServer:
             })
 
             with open(rec_file, 'rb') as f:
-                first_iframe = video_frames[start_video_idx]
+                # 与 Go 一致：读取 512KB 数据，因为 VPS/SPS/PPS 可能在 I 帧数据之前
                 f.seek(first_iframe.file_offset)
                 header_data = f.read(512 * 1024)
 
+                nal_type_names = {32: 'VPS', 33: 'SPS', 34: 'PPS', 19: 'IDR_W_RADL', 20: 'IDR_N_LP', 1: 'TRAIL_R'}
                 header_nals = self._parse_nal_units(header_data)
-                header_bytes = bytearray()
+                print(f"[StreamAV] 首帧区域解析出 {len(header_nals)} 个 NAL: {[(nal_type_names.get(t, f'NAL{t}'), s) for _, s, t in header_nals[:10]]}", flush=True)
 
-                for nal_offset, nal_size, nal_type in header_nals:
-                    if nal_type in (NalType.VPS, NalType.SPS, NalType.PPS):
-                        header_bytes.extend(header_data[nal_offset:nal_offset + nal_size])
-                    elif nal_type in (NalType.IDR_W_RADL, NalType.IDR_N_LP):
-                        if header_bytes:
-                            await self._send_nal_units(ws, bytes(header_bytes), actual_start_time * 1000)
-                            print(f"[StreamAV] 已发送视频头，大小={len(header_bytes)} 字节")
-
-                        idr_data = header_data[nal_offset:nal_offset + nal_size]
-                        idr_data = self._strip_start_code(idr_data)
-                        await self._send_frame(ws, idr_data, nal_type, actual_start_time * 1000)
-                        print(f"[StreamAV] 已发送 IDR 帧，大小={len(idr_data)} 字节")
+                # 找到 VPS 的起始位置，从 VPS 开始发送
+                vps_idx = -1
+                for i, (_, _, nal_type) in enumerate(header_nals):
+                    if nal_type == NalType.VPS:
+                        vps_idx = i
+                        print(f"[StreamAV] 找到 VPS 在 NAL[{i}]", flush=True)
                         break
+
+                if vps_idx < 0:
+                    print(f"[StreamAV] 警告: 未找到 VPS!", flush=True)
+                    await ws.send_json({"type": "error", "message": "未找到 VPS"})
+                    return
+
+                # 从 VPS 开始，按顺序发送 VPS -> SPS -> PPS -> IDR
+                sent_headers = []
+                idr_end_offset = 0  # IDR 结束位置（相对于 header_data）
+                for i in range(vps_idx, len(header_nals)):
+                    nal_offset, nal_size, nal_type = header_nals[i]
+                    nal_data = self._strip_start_code(header_data[nal_offset:nal_offset + nal_size])
+
+                    if nal_type in (NalType.VPS, NalType.SPS, NalType.PPS):
+                        await self._send_frame(ws, nal_data, nal_type, actual_start_time * 1000)
+                        sent_headers.append(f"{nal_type_names.get(nal_type)}({len(nal_data)})")
+                    elif nal_type in (NalType.IDR_W_RADL, NalType.IDR_N_LP):
+                        # 发送第一个 IDR 后停止
+                        await self._send_frame(ws, nal_data, nal_type, actual_start_time * 1000)
+                        sent_headers.append(f"IDR({len(nal_data)})")
+                        idr_end_offset = nal_offset + nal_size
+                        break
+
+                print(f"[StreamAV] 已发送视频头: {', '.join(sent_headers)}", flush=True)
+
+                # 计算 IDR 后的绝对文件位置
+                stream_pos = first_iframe.file_offset + idr_end_offset
+                print(f"[StreamAV] 从字节流位置 {stream_pos} 开始读取后续帧", flush=True)
 
                 # 设置音频帧起始索引
                 audio_idx = 0
@@ -654,16 +737,16 @@ class DVRServer:
                         audio_idx = i
                         break
 
-                frame_interval = 1.0 / 166.0 / speed
+                frame_interval = 1.0 / 25.0 / speed  # 25fps
                 current_time_ms = actual_start_time * 1000
                 frame_count = 0
                 last_log_time = time.time()
 
-                video_idx = start_video_idx + 1
+                # 使用字节流方式读取，而不是帧索引
+                buffer = bytearray()
+                CHUNK_SIZE = 64 * 1024
 
-                while video_idx < len(video_frames) and not ws.closed:
-                    vf = video_frames[video_idx]
-
+                while not ws.closed:
                     # 发送音频帧
                     while audio_idx < len(audio_frames):
                         af = audio_frames[audio_idx]
@@ -675,25 +758,52 @@ class DVRServer:
                         else:
                             break
 
-                    # 发送视频帧
-                    f.seek(vf.file_offset)
-                    video_data = f.read(vf.frame_size)
+                    # 读取更多数据到缓冲区
+                    if len(buffer) < 256 * 1024:
+                        f.seek(stream_pos)
+                        chunk = f.read(CHUNK_SIZE)
+                        if not chunk:
+                            # 文件结束
+                            print(f"[StreamAV] 文件结束", flush=True)
+                            break
+                        buffer.extend(chunk)
+                        stream_pos += len(chunk)
 
-                    nal_units = self._parse_nal_units(video_data)
-                    for nal_offset, nal_size, nal_type in nal_units:
-                        nal_data = self._strip_start_code(video_data[nal_offset:nal_offset + nal_size])
-                        await self._send_frame(ws, nal_data, nal_type, vf.unix_ts * 1000)
+                    # 解析缓冲区中的 NAL 单元
+                    nal_units = self._parse_nal_units(bytes(buffer))
+                    if len(nal_units) <= 1:
+                        # 数据不足，继续读取
+                        continue
 
-                    current_time_ms = vf.unix_ts * 1000
-                    frame_count += 1
-                    video_idx += 1
+                    # 发送除最后一个之外的所有 NAL（最后一个可能不完整）
+                    for nal_offset, nal_size, nal_type in nal_units[:-1]:
+                        nal_data = self._strip_start_code(bytes(buffer[nal_offset:nal_offset + nal_size]))
 
-                    await asyncio.sleep(frame_interval)
+                        # 遇到新的 IDR，需要先发送 VPS/SPS/PPS
+                        if nal_type in (NalType.IDR_W_RADL, NalType.IDR_N_LP):
+                            # 查找 VPS/SPS/PPS（应该在 IDR 之前）
+                            print(f"[StreamAV] 遇到新的 IDR", flush=True)
+
+                        await self._send_frame(ws, nal_data, nal_type, current_time_ms)
+
+                        # 只对视频帧计数和延迟
+                        is_video_frame = nal_type in (
+                            NalType.IDR_W_RADL, NalType.IDR_N_LP,
+                            NalType.TRAIL_R, NalType.TRAIL_N,
+                        )
+                        if is_video_frame:
+                            frame_count += 1
+                            current_time_ms += int(frame_interval * 1000)
+                            await asyncio.sleep(frame_interval)
+
+                    # 移除已处理的数据
+                    last_nal_end = nal_units[-2][0] + nal_units[-2][1]
+                    buffer = buffer[last_nal_end:]
 
                     now = time.time()
                     if now - last_log_time >= 1.0:
                         fps = frame_count / (now - last_log_time)
-                        print(f"[StreamAV] FPS: {fps:.1f}, 视频帧: {video_idx}/{len(video_frames)}, 音频帧: {audio_idx}/{len(audio_frames)}")
+                        print(f"[StreamAV] FPS: {fps:.1f}, 音频帧: {audio_idx}/{len(audio_frames)}, 缓冲区: {len(buffer)}B")
                         frame_count = 0
                         last_log_time = now
 
