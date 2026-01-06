@@ -32,7 +32,7 @@ mkdir -p "$INSTALL_DIR"
 # Download latest release
 DOWNLOAD_URL="https://github.com/$REPO/releases/latest/download/$ASSET"
 echo "Downloading from $DOWNLOAD_URL..."
-curl -fsSL "$DOWNLOAD_URL" -o "$INSTALL_DIR/$BINARY_NAME"
+curl -fL --progress-bar "$DOWNLOAD_URL" -o "$INSTALL_DIR/$BINARY_NAME"
 chmod +x "$INSTALL_DIR/$BINARY_NAME"
 
 echo ""
