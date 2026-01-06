@@ -1,7 +1,7 @@
 """
 数据模型 (仅 WebSocket 会话相关)
 
-TPS 文件相关的数据结构在 tps_storage_lib.py 中
+TPS 文件相关的数据结构在 seetong_lib.py 中
 """
 
 from dataclasses import dataclass

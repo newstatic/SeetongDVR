@@ -1,8 +1,7 @@
 """
 DVR 服务器核心类
 
-处理视频/音频流的读取和发送
-所有 TPS 文件解析算法都在 tps_storage_lib 中
+负责 WebSocket/HTTP 接口，所有算法调用 seetong_lib
 """
 
 import asyncio
@@ -10,21 +9,16 @@ import struct
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 from aiohttp import web
 
-from .tps_storage_lib import (
+from .seetong_lib import (
     TPSStorage,
     NalType,
-    FrameIndexRecord,
-    parse_nal_units,
-    strip_start_code,
-    find_vps_sps_pps_idr,
     CHANNEL_VIDEO_CH1,
     CHANNEL_AUDIO,
-    FRAME_TYPE_I,
 )
 
 from .config import (
@@ -207,16 +201,6 @@ class DVRServer:
         recordings.sort(key=lambda x: x["startTimestamp"])
         return {"recordings": recordings}
 
-    def find_entry_for_time(self, timestamp: int, channel: int) -> Optional[dict]:
-        """查找包含指定时间的录像条目"""
-        seg = self.storage.find_segment_by_time(timestamp, channel)
-        if seg:
-            return {
-                "entry": seg,
-                "file_index": seg.file_index
-            }
-        return None
-
     # ==================== 帧发送方法 ====================
 
     async def _send_frame(self, ws: web.WebSocketResponse, nal_data: bytes,
@@ -275,60 +259,64 @@ class DVRServer:
 
     async def stream_video_with_audio(self, ws: web.WebSocketResponse, channel: int,
                                        start_timestamp: int, speed: float = 1.0):
-        """流式传输音视频数据"""
+        """流式传输音视频数据
+
+        所有算法逻辑都在 seetong_lib 中，此方法只负责：
+        1. 调用 TPSStorage 的方法获取数据
+        2. 通过 WebSocket 发送帧
+        """
         if not self.loaded:
             await ws.send_json({"error": "DVR 未加载"})
             return
 
-        result = self.find_entry_for_time(start_timestamp, channel)
-        if not result:
+        # 1. 查找段落 (seetong_lib 算法)
+        seg = self.storage.find_segment_by_time(start_timestamp, channel)
+        if not seg:
             await ws.send_json({"error": "未找到指定时间的录像"})
             return
 
-        seg = result["entry"]
         file_index = seg.file_index
-
-        rec_file = self.storage.get_rec_file(file_index)
-        if not rec_file:
-            await ws.send_json({"error": f"录像文件不存在: TRec{file_index:06d}.tps"})
-            return
-
-        print(f"[StreamAV] file_index={file_index} -> {rec_file.name}")
-        print(f"[StreamAV] 时间范围: {seg.start_time} - {seg.end_time}")
+        print(f"[StreamAV] file_index={file_index}, 时间范围: {seg.start_time} - {seg.end_time}")
         print(f"[StreamAV] 请求时间戳: {start_timestamp}")
 
         try:
+            # 通道映射：前端 channel 1/2 -> 帧索引 channel 2/258
+            frame_channel = CHANNEL_VIDEO_CH1 if channel == 1 else (258 if channel == 2 else channel)
+
+            # 2. 查找 I 帧 (seetong_lib 算法)
+            print(f"[StreamAV] DEBUG: 开始查找 I 帧, file_index={file_index}, target_time={start_timestamp}, frame_channel={frame_channel}")
+            iframe, iframe_idx = self.storage.find_iframe_for_time(file_index, start_timestamp, frame_channel)
+            print(f"[StreamAV] DEBUG: find_iframe_for_time 返回: iframe={iframe}, idx={iframe_idx}")
+            if not iframe:
+                print(f"[StreamAV] ERROR: 未找到 I 帧!")
+                await ws.send_json({"error": "未找到 I 帧"})
+                return
+
+            # 3. 读取视频头 (seetong_lib 算法) - 先读取视频头获取实际起始位置
+            print(f"[StreamAV] DEBUG: 开始读取视频头, offset={iframe.file_offset}")
+            header_result = self.storage.read_video_header(file_index, iframe.file_offset)
+            print(f"[StreamAV] DEBUG: read_video_header 返回: {header_result is not None}")
+            if not header_result:
+                print(f"[StreamAV] ERROR: 未找到视频头!")
+                await ws.send_json({"type": "error", "message": "未找到视频头"})
+                return
+
+            vps, sps, pps, idr, stream_start_pos = header_result
+            print(f"[StreamAV] DEBUG: VPS={len(vps)}, SPS={len(sps)}, PPS={len(pps)}, IDR={len(idr)}, stream_pos={stream_start_pos}")
+
+            # 使用精确时间算法计算起始时间（PRD 附录 B 算法）
+            # 注意：使用 stream_start_pos 而不是 iframe.file_offset，因为视频实际从 IDR 后开始
+            actual_start_time = self.storage.get_precise_time_for_offset(file_index, stream_start_pos, frame_channel)
+            if actual_start_time == 0:
+                actual_start_time = iframe.unix_ts  # 回退到帧索引时间
+            print(f"[StreamAV] 从 I 帧 #{iframe_idx} 开始，精确时间: {actual_start_time}, unix_ts: {iframe.unix_ts}, iframe_offset: {iframe.file_offset}, stream_pos: {stream_start_pos}")
+
+            # 获取音频帧信息
             frame_index = self.storage.get_frame_index(file_index)
-            if not frame_index:
-                await ws.send_json({"error": "帧索引为空"})
-                return
-
-            # 分离视频帧和音频帧
-            video_frames = [f for f in frame_index if f.channel == CHANNEL_VIDEO_CH1]
             audio_frames = [f for f in frame_index if f.channel == CHANNEL_AUDIO]
+            print(f"[StreamAV] DEBUG: 帧索引总数={len(frame_index)}, 音频帧={len(audio_frames)}")
 
-            print(f"[StreamAV] 视频帧: {len(video_frames)}, 音频帧: {len(audio_frames)}")
-
-            if not video_frames:
-                await ws.send_json({"error": "未找到视频帧"})
-                return
-
-            # 查找最接近请求时间的 I 帧
-            start_video_idx = 0
-            for i, vf in enumerate(video_frames):
-                if vf.unix_ts >= start_timestamp:
-                    for j in range(i, -1, -1):
-                        if video_frames[j].frame_type == FRAME_TYPE_I:
-                            start_video_idx = j
-                            break
-                    else:
-                        start_video_idx = max(0, i - 1)
-                    break
-
-            first_iframe = video_frames[start_video_idx]
-            actual_start_time = first_iframe.unix_ts
-            print(f"[StreamAV] 从视频帧 #{start_video_idx} 开始，时间: {actual_start_time}")
-
+            print(f"[StreamAV] DEBUG: 准备发送 stream_start JSON")
             await ws.send_json({
                 "type": "stream_start",
                 "channel": channel,
@@ -339,100 +327,119 @@ class DVRServer:
                 "audioFormat": "g711-ulaw",
                 "audioSampleRate": AUDIO_SAMPLE_RATE,
             })
+            print(f"[StreamAV] DEBUG: stream_start JSON 已发送")
 
-            with open(rec_file, 'rb') as f:
-                # 读取 512KB 数据，查找 VPS/SPS/PPS/IDR
-                f.seek(first_iframe.file_offset)
-                header_data = f.read(512 * 1024)
+            # 4. 发送视频头
+            print(f"[StreamAV] DEBUG: 开始发送视频头...")
+            await self._send_frame(ws, vps, NalType.VPS, actual_start_time * 1000)
+            print(f"[StreamAV] DEBUG: VPS 已发送")
+            await self._send_frame(ws, sps, NalType.SPS, actual_start_time * 1000)
+            print(f"[StreamAV] DEBUG: SPS 已发送")
+            await self._send_frame(ws, pps, NalType.PPS, actual_start_time * 1000)
+            print(f"[StreamAV] DEBUG: PPS 已发送")
+            await self._send_frame(ws, idr, NalType.IDR_W_RADL, actual_start_time * 1000)
+            print(f"[StreamAV] DEBUG: IDR 已发送")
 
-                result = find_vps_sps_pps_idr(header_data)
-                if not result:
-                    print(f"[StreamAV] 警告: 未找到 VPS/SPS/PPS/IDR!")
-                    await ws.send_json({"type": "error", "message": "未找到视频头"})
-                    return
+            print(f"[StreamAV] 已发送视频头: VPS({len(vps)}), SPS({len(sps)}), PPS({len(pps)}), IDR({len(idr)})")
+            print(f"[StreamAV] 从字节流位置 {stream_start_pos} 开始读取后续帧")
 
-                vps, sps, pps, idr, idr_end_offset = result
+            # 5. 创建流读取器 (seetong_lib 算法) - 传入通道以启用精确时间计算
+            print(f"[StreamAV] DEBUG: 创建流读取器...")
+            stream_reader = self.storage.create_stream_reader(
+                file_index, stream_start_pos, actual_start_time * 1000, frame_channel
+            )
+            print(f"[StreamAV] DEBUG: stream_reader={stream_reader}, use_precise_time={stream_reader.use_precise_time if stream_reader else None}")
+            if not stream_reader:
+                print(f"[StreamAV] ERROR: 无法创建流读取器!")
+                await ws.send_json({"type": "error", "message": "无法创建流读取器"})
+                return
 
-                # 发送视频头
-                await self._send_frame(ws, vps, NalType.VPS, actual_start_time * 1000)
-                await self._send_frame(ws, sps, NalType.SPS, actual_start_time * 1000)
-                await self._send_frame(ws, pps, NalType.PPS, actual_start_time * 1000)
-                await self._send_frame(ws, idr, NalType.IDR_W_RADL, actual_start_time * 1000)
+            # 设置播放速度
+            fps = 25.0 * speed
+            stream_reader.set_fps(fps)
+            frame_interval = 1.0 / fps
+            print(f"[StreamAV] DEBUG: fps={fps}, frame_interval={frame_interval}")
 
-                print(f"[StreamAV] 已发送视频头: VPS({len(vps)}), SPS({len(sps)}), PPS({len(pps)}), IDR({len(idr)})")
+            # 设置音频帧起始索引
+            audio_idx = 0
+            for i, af in enumerate(audio_frames):
+                if af.unix_ts >= actual_start_time:
+                    audio_idx = i
+                    break
+            print(f"[StreamAV] DEBUG: 音频起始索引={audio_idx}")
 
-                # 计算后续帧的起始位置
-                stream_pos = first_iframe.file_offset + idr_end_offset
-                print(f"[StreamAV] 从字节流位置 {stream_pos} 开始读取后续帧")
+            frame_count = 0
+            total_frames_sent = 0
+            last_log_time = time.time()
+            rec_file = self.storage.get_rec_file(file_index)
+            print(f"[StreamAV] DEBUG: rec_file={rec_file}")
 
-                # 设置音频帧起始索引
-                audio_idx = 0
-                for i, af in enumerate(audio_frames):
-                    if af.unix_ts >= actual_start_time:
-                        audio_idx = i
-                        break
+            try:
+                with open(rec_file, 'rb') as audio_f:
+                    print(f"[StreamAV] DEBUG: 进入主循环, ws.closed={ws.closed}")
+                    loop_count = 0
+                    while not ws.closed:
+                        loop_count += 1
+                        if loop_count <= 3:
+                            print(f"[StreamAV] DEBUG: 循环 #{loop_count}")
 
-                frame_interval = 1.0 / 25.0 / speed
-                current_time_ms = actual_start_time * 1000
-                frame_count = 0
-                last_log_time = time.time()
+                        # 发送音频帧
+                        audio_sent = 0
+                        while audio_idx < len(audio_frames):
+                            af = audio_frames[audio_idx]
+                            if af.unix_ts * 1000 <= stream_reader.current_time_ms:
+                                audio_f.seek(af.file_offset)
+                                audio_data = audio_f.read(af.frame_size)
+                                await self._send_audio_frame(ws, audio_data, af.unix_ts * 1000)
+                                audio_idx += 1
+                                audio_sent += 1
+                            else:
+                                break
+                        if loop_count <= 3 and audio_sent > 0:
+                            print(f"[StreamAV] DEBUG: 发送了 {audio_sent} 个音频帧")
 
-                # 使用字节流方式读取
-                buffer = bytearray()
-                CHUNK_SIZE = 64 * 1024
+                        # 6. 使用流读取器读取 NAL 单元 (seetong_lib 算法)
+                        nal_count = 0
+                        if loop_count <= 3:
+                            print(f"[StreamAV] DEBUG: 调用 read_next_nals(), buffer_len={len(stream_reader.buffer)}, stream_pos={stream_reader.stream_pos}")
 
-                while not ws.closed:
-                    # 发送音频帧
-                    while audio_idx < len(audio_frames):
-                        af = audio_frames[audio_idx]
-                        if af.unix_ts * 1000 <= current_time_ms:
-                            f.seek(af.file_offset)
-                            audio_data = f.read(af.frame_size)
-                            await self._send_audio_frame(ws, audio_data, af.unix_ts * 1000)
-                            audio_idx += 1
-                        else:
+                        for nal_data, nal_type, timestamp_ms in stream_reader.read_next_nals():
+                            if nal_count == 0 and loop_count <= 3:
+                                print(f"[StreamAV] DEBUG: 第一个 NAL: type={nal_type}, size={len(nal_data)}")
+
+                            if NalType.is_keyframe(nal_type):
+                                print(f"[StreamAV] 遇到新的 IDR")
+
+                            await self._send_frame(ws, nal_data, nal_type, timestamp_ms)
+
+                            if NalType.is_video_frame(nal_type):
+                                frame_count += 1
+                                total_frames_sent += 1
+                                await asyncio.sleep(frame_interval)
+
+                            nal_count += 1
+
+                        if loop_count <= 3:
+                            print(f"[StreamAV] DEBUG: 本次循环 NAL 数量: {nal_count}")
+
+                        if nal_count == 0:
+                            print(f"[StreamAV] 文件结束, 总共发送 {total_frames_sent} 帧")
                             break
 
-                    # 读取更多数据到缓冲区
-                    if len(buffer) < 256 * 1024:
-                        f.seek(stream_pos)
-                        chunk = f.read(CHUNK_SIZE)
-                        if not chunk:
-                            print(f"[StreamAV] 文件结束")
-                            break
-                        buffer.extend(chunk)
-                        stream_pos += len(chunk)
+                        now = time.time()
+                        if now - last_log_time >= 1.0:
+                            actual_fps = frame_count / (now - last_log_time)
+                            print(f"[StreamAV] FPS: {actual_fps:.1f}, 音频帧: {audio_idx}/{len(audio_frames)}, 总帧数: {total_frames_sent}")
+                            frame_count = 0
+                            last_log_time = now
 
-                    # 解析缓冲区中的 NAL 单元
-                    nal_units = parse_nal_units(bytes(buffer))
-                    if len(nal_units) <= 1:
-                        continue
+            finally:
+                # 关闭流读取器的文件句柄
+                print(f"[StreamAV] DEBUG: finally 块, 关闭流读取器")
+                if stream_reader and stream_reader.f:
+                    stream_reader.f.close()
 
-                    # 发送除最后一个之外的所有 NAL
-                    for nal_offset, nal_size, nal_type in nal_units[:-1]:
-                        nal_data = strip_start_code(bytes(buffer[nal_offset:nal_offset + nal_size]))
-
-                        if NalType.is_keyframe(nal_type):
-                            print(f"[StreamAV] 遇到新的 IDR")
-
-                        await self._send_frame(ws, nal_data, nal_type, current_time_ms)
-
-                        if NalType.is_video_frame(nal_type):
-                            frame_count += 1
-                            current_time_ms += int(frame_interval * 1000)
-                            await asyncio.sleep(frame_interval)
-
-                    # 移除已处理的数据
-                    last_nal_end = nal_units[-2][0] + nal_units[-2][1]
-                    buffer = buffer[last_nal_end:]
-
-                    now = time.time()
-                    if now - last_log_time >= 1.0:
-                        fps = frame_count / (now - last_log_time)
-                        print(f"[StreamAV] FPS: {fps:.1f}, 音频帧: {audio_idx}/{len(audio_frames)}")
-                        frame_count = 0
-                        last_log_time = now
-
+            print(f"[StreamAV] DEBUG: 发送 stream_end")
             await ws.send_json({"type": "stream_end"})
 
         except Exception as e:

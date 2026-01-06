@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-天视通 (Seetong) DVR TPS 文件存储库
+天视通 (Seetong) DVR 算法库
 
 统一管理所有 TPS 文件格式解析和视频数据处理算法。
 
@@ -222,17 +222,93 @@ class NalUnit:
     data: bytes = None  # NAL 数据（不含起始码），可选
 
 
-@dataclass
-class VideoStreamState:
-    """视频流读取状态"""
-    file_handle: BinaryIO
-    stream_pos: int          # 当前读取位置
-    buffer: bytearray        # 读取缓冲区
-    current_time_ms: int     # 当前时间戳（毫秒）
-    frame_count: int = 0     # 已发送帧数
-    vps: bytes = None        # 缓存的 VPS
-    sps: bytes = None        # 缓存的 SPS
-    pps: bytes = None        # 缓存的 PPS
+# ============================================================================
+# 精确时间计算
+# ============================================================================
+
+def calculate_precise_time(seg: 'SegmentRecord', byte_offset: int,
+                           data_region_size: int = TREC_INDEX_REGION_START) -> int:
+    """根据字节偏移计算精确时间戳（简化版）
+
+    使用字节位置线性插值公式：
+    precise_time = start_time + (byte_offset / data_region_size) × duration
+
+    Args:
+        seg: 段落记录（包含 start_time, end_time）
+        byte_offset: 数据在文件中的字节偏移
+        data_region_size: 数据区域总大小（默认 0x0F900000）
+
+    Returns:
+        精确的 Unix 时间戳（秒）
+    """
+    if data_region_size <= 0:
+        return seg.start_time
+
+    duration = seg.end_time - seg.start_time
+    time_offset = (byte_offset / data_region_size) * duration
+    return int(seg.start_time + time_offset)
+
+
+def calculate_precise_time_from_iframes(
+    i_frames: list,
+    target_offset: int,
+    seg: 'SegmentRecord'
+) -> int:
+    """根据 I 帧列表计算目标偏移的精确时间
+
+    PRD 附录 B 精确算法：使用相邻 I 帧的字节范围和时间范围进行插值
+
+    Args:
+        i_frames: I 帧列表，每个元素为 (offset, unix_ts)，按 offset 排序
+        target_offset: 目标字节偏移
+        seg: 段落记录
+
+    Returns:
+        精确的 Unix 时间戳（秒）
+    """
+    if not i_frames:
+        return seg.start_time
+
+    # 如果只有一个 I 帧，使用简化算法
+    if len(i_frames) == 1:
+        return calculate_precise_time(seg, target_offset)
+
+    # 找到 target_offset 所在的 I 帧区间
+    prev_iframe = None
+    next_iframe = None
+
+    for i, (offset, ts) in enumerate(i_frames):
+        if offset <= target_offset:
+            prev_iframe = (offset, ts)
+            if i + 1 < len(i_frames):
+                next_iframe = i_frames[i + 1]
+        else:
+            if prev_iframe is None:
+                # target 在第一个 I 帧之前
+                prev_iframe = (0, seg.start_time)
+                next_iframe = (offset, ts)
+            break
+
+    if prev_iframe is None:
+        return seg.start_time
+
+    if next_iframe is None:
+        # target 在最后一个 I 帧之后，使用段落结束时间
+        next_iframe = (TREC_INDEX_REGION_START, seg.end_time)
+
+    # 计算插值
+    prev_offset, prev_time = prev_iframe
+    next_offset, next_time = next_iframe
+
+    byte_range = next_offset - prev_offset
+    if byte_range <= 0:
+        return prev_time
+
+    time_range = next_time - prev_time
+    byte_offset_in_range = target_offset - prev_offset
+
+    time_offset = (byte_offset_in_range / byte_range) * time_range
+    return int(prev_time + time_offset)
 
 
 # ============================================================================
@@ -637,22 +713,42 @@ class VideoStreamReader:
     """视频流读取器
 
     从指定位置连续读取 NAL 单元，支持缓冲区管理
+    支持两种时间计算模式：
+    1. 帧率累加模式（默认）：每帧时间 = 上一帧时间 + 帧间隔
+    2. 字节偏移模式：每帧时间 = 根据字节偏移插值计算
     """
 
     CHUNK_SIZE = 64 * 1024  # 64KB
     MIN_BUFFER_SIZE = 256 * 1024  # 256KB
 
-    def __init__(self, file_handle: BinaryIO, start_pos: int, start_time_ms: int):
+    def __init__(self, file_handle: BinaryIO, start_pos: int, start_time_ms: int,
+                 seg: 'SegmentRecord' = None, frame_offsets: List[Tuple[int, int]] = None):
         self.f = file_handle
         self.stream_pos = start_pos
         self.buffer = bytearray()
+        self.buffer_start_pos = start_pos  # 缓冲区对应的文件起始位置
         self.current_time_ms = start_time_ms
         self.frame_interval_ms = 40  # 25fps
         self.frame_count = 0
 
+        # 字节偏移时间计算所需的信息
+        self.seg = seg
+        self.frame_offsets = frame_offsets  # [(offset, unix_ts), ...] 用于精确时间计算
+        self.use_precise_time = seg is not None and frame_offsets is not None
+
     def set_fps(self, fps: float):
         """设置帧率"""
         self.frame_interval_ms = int(1000 / fps)
+
+    def _get_precise_time_ms(self, nal_file_offset: int) -> int:
+        """根据 NAL 的文件偏移计算精确时间（毫秒）"""
+        if not self.use_precise_time:
+            return self.current_time_ms
+
+        precise_time = calculate_precise_time_from_iframes(
+            self.frame_offsets, nal_file_offset, self.seg
+        )
+        return precise_time * 1000
 
     def _fill_buffer(self) -> bool:
         """填充缓冲区
@@ -666,7 +762,12 @@ class VideoStreamReader:
         self.f.seek(self.stream_pos)
         chunk = self.f.read(self.CHUNK_SIZE)
         if not chunk:
+            print(f"[VideoStreamReader] _fill_buffer: 文件结束, stream_pos={self.stream_pos}")
             return False
+
+        # 如果缓冲区为空，更新缓冲区起始位置
+        if len(self.buffer) == 0:
+            self.buffer_start_pos = self.stream_pos
 
         self.buffer.extend(chunk)
         self.stream_pos += len(chunk)
@@ -681,26 +782,63 @@ class VideoStreamReader:
             - nal_type: NAL 类型
             - timestamp_ms: 时间戳
         """
-        if not self._fill_buffer():
-            return
+        # 尝试多次填充缓冲区，跳过非 NAL 数据
+        max_attempts = 10
+        for attempt in range(max_attempts):
+            if not self._fill_buffer():
+                print(f"[VideoStreamReader] read_next_nals: _fill_buffer 返回 False, attempt={attempt}")
+                return
 
-        nal_units = parse_nal_units(bytes(self.buffer))
-        if len(nal_units) <= 1:
+            nal_units = parse_nal_units(bytes(self.buffer))
+            if self.frame_count == 0 or attempt > 0:
+                print(f"[VideoStreamReader] read_next_nals: buffer_len={len(self.buffer)}, nal_units_count={len(nal_units)}, attempt={attempt}")
+
+            if len(nal_units) >= 2:
+                break  # 找到足够的 NAL 单元
+
+            # NAL 单元不足，可能遇到非视频数据区域
+            if len(nal_units) == 0:
+                # 完全没有 NAL 起始码，跳过整个缓冲区
+                print(f"[VideoStreamReader] read_next_nals: 无 NAL 起始码, 跳过 {len(self.buffer)} 字节, 前32字节: {self.buffer[:32].hex()}")
+                self.buffer.clear()
+            elif len(nal_units) == 1:
+                # 只有一个不完整的 NAL，需要更多数据
+                # 强制读取更多数据
+                self.f.seek(self.stream_pos)
+                chunk = self.f.read(self.CHUNK_SIZE * 4)  # 读取更大的块
+                if not chunk:
+                    print(f"[VideoStreamReader] read_next_nals: 无法读取更多数据")
+                    return
+                self.buffer.extend(chunk)
+                self.stream_pos += len(chunk)
+        else:
+            # 多次尝试后仍然失败
+            print(f"[VideoStreamReader] read_next_nals: {max_attempts} 次尝试后仍无法找到 NAL 单元")
             return
 
         # 发送除最后一个之外的所有 NAL（最后一个可能不完整）
         for offset, size, nal_type in nal_units[:-1]:
             nal_data = strip_start_code(bytes(self.buffer[offset:offset + size]))
 
-            yield (nal_data, nal_type, self.current_time_ms)
+            # 计算此 NAL 的文件偏移
+            nal_file_offset = self.buffer_start_pos + offset
 
-            # 视频帧更新时间戳
+            # 使用精确时间或帧率累加时间
+            if self.use_precise_time and NalType.is_video_frame(nal_type):
+                timestamp_ms = self._get_precise_time_ms(nal_file_offset)
+            else:
+                timestamp_ms = self.current_time_ms
+
+            yield (nal_data, nal_type, timestamp_ms)
+
+            # 视频帧更新时间戳（用于非精确模式的回退）
             if NalType.is_video_frame(nal_type):
                 self.frame_count += 1
                 self.current_time_ms += self.frame_interval_ms
 
-        # 移除已处理的数据
+        # 移除已处理的数据，更新缓冲区起始位置
         last_nal_end = nal_units[-2][0] + nal_units[-2][1]
+        self.buffer_start_pos += last_nal_end
         self.buffer = self.buffer[last_nal_end:]
 
 
@@ -721,6 +859,7 @@ class TPSStorage:
         self.entry_count = 0
         self._frame_index_cache: dict = {}
         self._vps_cache: dict = {}
+        self._iframe_offsets_cache: dict = {}  # 缓存 I 帧偏移列表: {(file_index, channel): [(offset, unix_ts), ...]}
         self.loaded = False
 
     def load(self) -> bool:
@@ -751,6 +890,45 @@ class TPSStorage:
                 return seg
         return None
 
+    def get_segment_by_file_index(self, file_index: int) -> Optional[SegmentRecord]:
+        """根据文件索引查找段落"""
+        for seg in self.segments:
+            if seg.file_index == file_index:
+                return seg
+        return None
+
+    def get_iframe_offsets(self, file_index: int, channel: int) -> List[Tuple[int, int]]:
+        """获取 I 帧偏移列表（带缓存）
+
+        Args:
+            file_index: TRec 文件编号
+            channel: 通道号
+
+        Returns:
+            [(offset, unix_ts), ...] 按 offset 排序
+            如果没有 frame_type=1 的帧，返回采样的帧偏移列表
+        """
+        cache_key = (file_index, channel)
+        if cache_key in self._iframe_offsets_cache:
+            return self._iframe_offsets_cache[cache_key]
+
+        frame_index = self.get_frame_index(file_index)
+        video_frames = [f for f in frame_index if f.channel == channel]
+
+        # 先尝试获取 frame_type=1 的 I 帧
+        i_frame_offsets = [(vf.file_offset, vf.unix_ts) for vf in video_frames if vf.frame_type == FRAME_TYPE_I]
+
+        # 如果没有 frame_type=1 的帧，使用采样的帧偏移
+        if not i_frame_offsets and video_frames:
+            sample_interval = max(1, len(video_frames) // 100)
+            i_frame_offsets = [(video_frames[i].file_offset, video_frames[i].unix_ts)
+                               for i in range(0, len(video_frames), sample_interval)]
+
+        i_frame_offsets.sort(key=lambda x: x[0])
+
+        self._iframe_offsets_cache[cache_key] = i_frame_offsets
+        return i_frame_offsets
+
     def get_frame_index(self, file_index: int) -> List[FrameIndexRecord]:
         """获取帧索引（带缓存）"""
         if file_index in self._frame_index_cache:
@@ -768,6 +946,8 @@ class TPSStorage:
                              ) -> Tuple[Optional[FrameIndexRecord], int]:
         """查找最接近目标时间的 I 帧
 
+        使用精确时间算法：根据字节偏移插值计算每帧的精确时间
+
         Args:
             file_index: TRec 文件编号
             target_time: 目标时间戳（秒）
@@ -776,25 +956,138 @@ class TPSStorage:
         Returns:
             (frame_record, frame_index) 或 (None, -1)
         """
+        print(f"[seetong_lib] find_iframe_for_time: file_index={file_index}, target_time={target_time}, channel={channel}")
+
+        # 获取段落信息（用于精确时间计算）
+        seg = self.get_segment_by_file_index(file_index)
+
         frame_index = self.get_frame_index(file_index)
         if not frame_index:
+            print(f"[seetong_lib] find_iframe_for_time: 帧索引为空!")
             return None, -1
 
         # 过滤视频帧
         video_frames = [f for f in frame_index if f.channel == channel]
+        print(f"[seetong_lib] find_iframe_for_time: 总帧数={len(frame_index)}, 视频帧={len(video_frames)}")
         if not video_frames:
+            print(f"[seetong_lib] find_iframe_for_time: 无视频帧!")
             return None, -1
 
-        # 找到目标时间附近的 I 帧
+        # 调试：统计 frame_type 分布
+        frame_types = {}
+        for vf in video_frames[:1000]:  # 只检查前1000帧
+            ft = vf.frame_type
+            frame_types[ft] = frame_types.get(ft, 0) + 1
+        print(f"[seetong_lib] find_iframe_for_time: frame_type 分布（前1000帧）: {frame_types}")
+
+        # 检查是否有 frame_type=1 的 I 帧
+        has_iframe_type = FRAME_TYPE_I in frame_types
+
+        # 使用精确时间算法查找 I 帧
+        if seg:
+            print(f"[seetong_lib] find_iframe_for_time: 使用精确时间算法, seg.start={seg.start_time}, seg.end={seg.end_time}")
+
+            if has_iframe_type:
+                # 使用缓存的 I 帧偏移列表
+                i_frame_offsets = self.get_iframe_offsets(file_index, channel)
+                print(f"[seetong_lib] find_iframe_for_time: I 帧偏移列表长度={len(i_frame_offsets)}")
+
+                # 收集所有 I 帧及其精确时间（使用相邻 I 帧插值）
+                i_frames = []
+                for idx, vf in enumerate(video_frames):
+                    if vf.frame_type == FRAME_TYPE_I:
+                        # 使用相邻 I 帧进行精确插值
+                        precise_time = calculate_precise_time_from_iframes(i_frame_offsets, vf.file_offset, seg)
+                        i_frames.append((idx, vf, precise_time))
+            else:
+                # 没有 frame_type=1 的帧，使用简化的字节偏移时间算法
+                # 每个视频帧都可以作为起点（通过 VPS 搜索找到关键帧）
+                print(f"[seetong_lib] find_iframe_for_time: 无 frame_type=1，使用字节偏移算法")
+                i_frames = []
+                # 每隔一定数量的帧采样一个作为潜在的 I 帧位置
+                sample_interval = max(1, len(video_frames) // 100)  # 约 100 个采样点
+                for idx in range(0, len(video_frames), sample_interval):
+                    vf = video_frames[idx]
+                    precise_time = calculate_precise_time(seg, vf.file_offset)
+                    i_frames.append((idx, vf, precise_time))
+                print(f"[seetong_lib] find_iframe_for_time: 采样了 {len(i_frames)} 个帧作为潜在 I 帧")
+
+            print(f"[seetong_lib] find_iframe_for_time: 找到 {len(i_frames)} 个 I 帧")
+            if i_frames:
+                # 找到目标时间之前最近的 I 帧
+                best_iframe = None
+                best_idx = -1
+                best_time = 0
+
+                for idx, vf, precise_time in i_frames:
+                    if precise_time <= target_time:
+                        if best_iframe is None or precise_time > best_time:
+                            best_iframe = vf
+                            best_idx = idx
+                            best_time = precise_time
+
+                # 如果没有找到之前的 I 帧，使用第一个
+                if best_iframe is None:
+                    best_idx, best_iframe, best_time = i_frames[0]
+
+                print(f"[seetong_lib] find_iframe_for_time: 精确算法找到 I 帧 idx={best_idx}, "
+                      f"offset={best_iframe.file_offset}, precise_time={best_time}, "
+                      f"diff={target_time - best_time}s")
+                return best_iframe, best_idx
+
+        # 回退：使用 unix_ts 字段
+        print(f"[seetong_lib] find_iframe_for_time: 使用 unix_ts 回退算法")
+        if video_frames:
+            print(f"[seetong_lib] find_iframe_for_time: 视频帧时间范围 {video_frames[0].unix_ts} - {video_frames[-1].unix_ts}")
+
         for i, vf in enumerate(video_frames):
             if vf.unix_ts >= target_time:
-                # 向前查找最近的 I 帧
-                for j in range(i, -1, -1):
-                    if video_frames[j].frame_type == FRAME_TYPE_I:
-                        return video_frames[j], j
-                return video_frames[max(0, i - 1)], max(0, i - 1)
+                if has_iframe_type:
+                    # 从当前位置向前找最近的 I 帧
+                    for j in range(i, -1, -1):
+                        if video_frames[j].frame_type == FRAME_TYPE_I:
+                            print(f"[seetong_lib] find_iframe_for_time: 找到 I 帧 j={j}, offset={video_frames[j].file_offset}")
+                            return video_frames[j], j
+                    # 没找到之前的 I 帧，从当前位置向后找
+                    for j in range(i, len(video_frames)):
+                        if video_frames[j].frame_type == FRAME_TYPE_I:
+                            print(f"[seetong_lib] find_iframe_for_time: 向后找到 I 帧 j={j}, offset={video_frames[j].file_offset}")
+                            return video_frames[j], j
+                    # 完全没有 I 帧，返回失败
+                    print(f"[seetong_lib] find_iframe_for_time: 回退算法未找到任何 I 帧!")
+                    return None, -1
+                else:
+                    # 没有 frame_type=1，直接使用当前帧（通过 VPS 搜索找关键帧）
+                    print(f"[seetong_lib] find_iframe_for_time: 无 frame_type=1，使用帧 i={i}, offset={vf.file_offset}")
+                    return vf, i
 
+        print(f"[seetong_lib] find_iframe_for_time: 目标时间超出范围!")
         return None, -1
+
+    def get_precise_time_for_offset(self, file_index: int, byte_offset: int, channel: int = CHANNEL_VIDEO_CH1) -> int:
+        """根据字节偏移获取精确时间戳
+
+        使用 PRD 附录 B 精确算法：基于相邻 I 帧的字节范围进行插值
+
+        Args:
+            file_index: TRec 文件编号
+            byte_offset: 数据在文件中的字节偏移
+            channel: 通道号
+
+        Returns:
+            精确的 Unix 时间戳（秒）
+        """
+        seg = self.get_segment_by_file_index(file_index)
+        if seg is None:
+            return 0
+
+        # 使用缓存的 I 帧偏移列表
+        i_frame_offsets = self.get_iframe_offsets(file_index, channel)
+
+        if i_frame_offsets:
+            return calculate_precise_time_from_iframes(i_frame_offsets, byte_offset, seg)
+        else:
+            return calculate_precise_time(seg, byte_offset)
 
     def read_video_header(self, file_index: int, iframe_offset: int
                           ) -> Optional[Tuple[bytes, bytes, bytes, bytes, int]]:
@@ -810,23 +1103,30 @@ class TPSStorage:
             (vps, sps, pps, idr, stream_start_pos) 或 None
             - stream_start_pos: IDR 结束后的绝对文件位置，用于继续读取 P 帧
         """
+        print(f"[seetong_lib] read_video_header: file_index={file_index}, iframe_offset={iframe_offset}")
         rec_file = self.get_rec_file(file_index)
         if not rec_file:
+            print(f"[seetong_lib] read_video_header: rec_file 不存在!")
             return None
 
+        print(f"[seetong_lib] read_video_header: 打开文件 {rec_file}")
         with open(rec_file, 'rb') as f:
             f.seek(iframe_offset)
             data = f.read(512 * 1024)  # 读取 512KB
+            print(f"[seetong_lib] read_video_header: 读取了 {len(data)} 字节")
 
             result = find_vps_sps_pps_idr(data)
             if result:
                 vps, sps, pps, idr, idr_end_offset = result
                 stream_start_pos = iframe_offset + idr_end_offset
+                print(f"[seetong_lib] read_video_header: 找到视频头, idr_end_offset={idr_end_offset}, stream_start_pos={stream_start_pos}")
                 return (vps, sps, pps, idr, stream_start_pos)
 
+        print(f"[seetong_lib] read_video_header: 未找到 VPS/SPS/PPS/IDR!")
         return None
 
-    def create_stream_reader(self, file_index: int, stream_pos: int, start_time_ms: int
+    def create_stream_reader(self, file_index: int, stream_pos: int, start_time_ms: int,
+                             channel: int = CHANNEL_VIDEO_CH1
                              ) -> Optional[VideoStreamReader]:
         """创建视频流读取器
 
@@ -834,6 +1134,7 @@ class TPSStorage:
             file_index: TRec 文件编号
             stream_pos: 开始读取的文件位置
             start_time_ms: 开始时间戳（毫秒）
+            channel: 通道号（用于获取帧偏移列表）
 
         Returns:
             VideoStreamReader 或 None
@@ -842,8 +1143,12 @@ class TPSStorage:
         if not rec_file:
             return None
 
+        # 获取段落信息和帧偏移列表（用于精确时间计算）
+        seg = self.get_segment_by_file_index(file_index)
+        frame_offsets = self.get_iframe_offsets(file_index, channel)
+
         f = open(rec_file, 'rb')
-        return VideoStreamReader(f, stream_pos, start_time_ms)
+        return VideoStreamReader(f, stream_pos, start_time_ms, seg, frame_offsets)
 
 
 # ============================================================================
