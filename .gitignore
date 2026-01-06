@@ -10,8 +10,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -66,3 +66,5 @@ tesseract_train/ground-truth/
 .index_cache/
 seetong-dvr
 
+dvr-server
+go.sum

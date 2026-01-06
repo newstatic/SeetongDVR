@@ -129,6 +129,9 @@ export class HEVCDecoder {
       this.decoder.close();
     }
 
+    // 完全重置所有状态
+    this.reset();
+
     this.decoder = new VideoDecoder({
       output: (frame) => {
         this.frameCount++;
@@ -151,8 +154,6 @@ export class HEVCDecoder {
       },
     });
 
-    this.isConfigured = false;
-    this.waitingForKeyframe = true;
     this.callbacks.onLog('解码器已初始化', 'info');
   }
 

@@ -7,16 +7,23 @@ import (
 	"os/signal"
 	"syscall"
 
+	"seetong-dvr/internal/seetong"
 	"seetong-dvr/internal/server"
 
 	"github.com/kataras/iris/v12"
 )
 
 func main() {
-	port := flag.Int("port", 8091, "Server port")
-	dvrPath := flag.String("path", "/Volumes/DVR-2T/Seetong/Stream", "DVR base path")
+	port := flag.Int("port", 8000, "Server port")
+	dvrPath := flag.String("path", "/Volumes/NO NAME", "DVR base path")
 	webPath := flag.String("web", "./web/dist", "Web static files path")
+	debug := flag.Bool("debug", true, "Enable debug logging")
 	flag.Parse()
+
+	// 设置日志级别
+	if *debug {
+		seetong.SetDebugMode(true)
+	}
 
 	fmt.Println("============================================================")
 	fmt.Println("天视通 DVR Web 服务器 (Go)")
@@ -25,29 +32,9 @@ func main() {
 	fmt.Printf("监听地址: http://localhost:%d\n", *port)
 	fmt.Println("============================================================")
 
-	// 创建 DVR 服务器（不立即加载）
+	// 创建 DVR 服务器（不立即加载，等待前端设置）
 	dvr := server.NewDVRServer(*dvrPath)
 	defer dvr.Close()
-
-	// 检查路径是否存在，存在则自动加载
-	if _, err := os.Stat(*dvrPath); err == nil {
-		fmt.Println("正在加载 DVR 数据...")
-		if err := dvr.Load(); err != nil {
-			fmt.Printf("警告: 加载失败: %v\n", err)
-			fmt.Println("服务器将继续运行，请通过 API 设置正确的路径")
-		} else {
-			// 后台构建 VPS 缓存
-			go func() {
-				fmt.Println("正在构建 VPS 缓存...")
-				if err := dvr.BuildVPSCache(); err != nil {
-					fmt.Printf("警告: 构建 VPS 缓存失败: %v\n", err)
-				}
-			}()
-		}
-	} else {
-		fmt.Printf("警告: DVR 路径不存在: %s\n", *dvrPath)
-		fmt.Println("服务器将继续运行，请通过 API 或前端设置正确的路径")
-	}
 
 	// 创建 Iris 应用
 	app := iris.New()
