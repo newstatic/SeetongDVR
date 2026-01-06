@@ -40,47 +40,48 @@ export function StatsPanel({ stats, connectionStatus }: StatsPanelProps) {
   };
 
   return (
-    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-      <StatCard
-        label="连接状态"
-        value={getStatusText()}
-        indicator={<div className={`w-3 h-3 rounded-full ${getStatusColor()}`} />}
-      />
-      <StatCard
-        label="FPS"
-        value={stats.fps.toString()}
-        sublabel={stats.isConfigured ? '解码中' : '等待配置'}
-      />
-      <StatCard
-        label="已解码帧"
-        value={stats.framesDecoded.toLocaleString()}
-      />
-      <StatCard
-        label="接收数据"
-        value={formatBytes(stats.totalBytes)}
-      />
+    <div className="bg-slate-800/50 rounded-xl p-3 border border-slate-700/50 space-y-2">
+      <div className="flex items-center justify-between gap-3">
+        <StatItem
+          label="状态"
+          value={getStatusText()}
+          indicator={<div className={`w-2 h-2 rounded-full ${getStatusColor()}`} />}
+        />
+        <StatItem
+          label="FPS"
+          value={stats.fps.toString()}
+        />
+      </div>
+      <div className="text-xs text-slate-400 space-y-1">
+        <div className="flex justify-between">
+          <span>帧数</span>
+          <span className="text-primary-400">{stats.framesDecoded.toLocaleString()}</span>
+        </div>
+        <div className="flex justify-between">
+          <span>传输数据</span>
+          <span className="text-primary-400">{formatBytes(stats.totalBytes)}</span>
+        </div>
+      </div>
     </div>
   );
 }
 
-interface StatCardProps {
+interface StatItemProps {
   label: string;
   value: string;
-  sublabel?: string;
   indicator?: React.ReactNode;
+  sublabel?: string;
 }
 
-function StatCard({ label, value, sublabel, indicator }: StatCardProps) {
+function StatItem({ label, value, indicator, sublabel }: StatItemProps) {
   return (
-    <div className="bg-slate-800/50 rounded-xl p-4 border border-slate-700/50">
-      <div className="flex items-center gap-2 mb-1">
+    <div className="text-center flex-1">
+      <div className="flex items-center justify-center gap-1 mb-0.5">
         {indicator}
-        <span className="text-xs text-slate-400 uppercase tracking-wide">{label}</span>
+        <span className="text-[10px] text-slate-500">{label}</span>
       </div>
-      <div className="text-2xl font-bold text-primary-400">{value}</div>
-      {sublabel && (
-        <div className="text-xs text-slate-500 mt-1">{sublabel}</div>
-      )}
+      <div className="text-sm font-semibold text-primary-400">{value}</div>
+      {sublabel && <div className="text-[10px] text-slate-500">{sublabel}</div>}
     </div>
   );
 }

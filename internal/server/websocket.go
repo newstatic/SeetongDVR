@@ -1,16 +1,17 @@
 package server
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"seetong-dvr/internal/models"
-	"seetong-dvr/internal/trec"
+	"seetong-dvr/internal/seetong"
 
 	"github.com/gorilla/websocket"
 	"github.com/kataras/iris/v12"
@@ -28,17 +29,21 @@ type WSMessage struct {
 	Channel   int     `json:"channel"`
 	Timestamp int64   `json:"timestamp"`
 	Speed     float64 `json:"speed"`
-	Audio     bool    `json:"audio"`
 }
 
 // StreamSession 流会话
 type StreamSession struct {
 	ws       *websocket.Conn
-	dvr      *DVRServer
-	stopChan chan struct{}
+	handlers *Handlers          // 引用 Handlers 以获取最新的 DVR
+	cancel   context.CancelFunc // 当前流的取消函数
+	streamID uint64             // 当前流的 ID
 	mu       sync.Mutex
-	running  bool
+	wg       sync.WaitGroup
 }
+
+var streamCounter uint64 // 全局流计数器
+
+const audioSampleRate = 8000
 
 // HandleWebSocket WebSocket 处理器
 func (h *Handlers) HandleWebSocket(ctx iris.Context) {
@@ -51,18 +56,11 @@ func (h *Handlers) HandleWebSocket(ctx iris.Context) {
 
 	session := &StreamSession{
 		ws:       ws,
-		dvr:      h.dvr,
-		stopChan: make(chan struct{}),
+		handlers: h,
 	}
 
 	sessionID := fmt.Sprintf("%p", ws)
 	fmt.Printf("[WS] 新连接: %s\n", sessionID)
-
-	// 发送连接确认
-	session.sendJSON(map[string]interface{}{
-		"type":    "connected",
-		"message": "WebSocket 连接成功",
-	})
 
 	for {
 		_, message, err := ws.ReadMessage()
@@ -73,17 +71,11 @@ func (h *Handlers) HandleWebSocket(ctx iris.Context) {
 			break
 		}
 
-		fmt.Printf("[WS] 收到消息: %s\n", string(message))
-
 		var msg WSMessage
 		if err := json.Unmarshal(message, &msg); err != nil {
-			fmt.Printf("[WS] JSON 解析错误: %v\n", err)
 			session.sendJSON(map[string]interface{}{"error": "无效的 JSON"})
 			continue
 		}
-
-		fmt.Printf("[WS] 解析结果: action=%s, ch=%d, ts=%d, speed=%.1f, audio=%v\n",
-			msg.Action, msg.Channel, msg.Timestamp, msg.Speed, msg.Audio)
 
 		switch msg.Action {
 		case "play":
@@ -91,13 +83,9 @@ func (h *Handlers) HandleWebSocket(ctx iris.Context) {
 			if msg.Speed == 0 {
 				msg.Speed = 1.0
 			}
-			fmt.Printf("[WS] 开始播放: ch=%d, ts=%d, speed=%.1f, audio=%v\n",
-				msg.Channel, msg.Timestamp, msg.Speed, msg.Audio)
-			if msg.Audio {
-				go session.streamVideoWithAudio(msg.Channel, msg.Timestamp, msg.Speed)
-			} else {
-				go session.streamVideo(msg.Channel, msg.Timestamp, msg.Speed)
-			}
+			fmt.Printf("[WS] 开始播放: ch=%d, ts=%d, speed=%.1f\n",
+				msg.Channel, msg.Timestamp, msg.Speed)
+			session.startStream(msg.Channel, msg.Timestamp, msg.Speed)
 
 		case "pause":
 			session.stop()
@@ -108,12 +96,8 @@ func (h *Handlers) HandleWebSocket(ctx iris.Context) {
 			if msg.Speed == 0 {
 				msg.Speed = 1.0
 			}
-			if msg.Audio {
-				go session.streamVideoWithAudio(msg.Channel, msg.Timestamp, msg.Speed)
-			} else {
-				go session.streamVideo(msg.Channel, msg.Timestamp, msg.Speed)
-			}
-			fmt.Printf("[WS] Seek: ts=%d, audio=%v\n", msg.Timestamp, msg.Audio)
+			session.startStream(msg.Channel, msg.Timestamp, msg.Speed)
+			fmt.Printf("[WS] Seek: ts=%d\n", msg.Timestamp)
 
 		case "speed":
 			fmt.Printf("[WS] 速度变更: %.1fx\n", msg.Speed)
@@ -124,398 +108,287 @@ func (h *Handlers) HandleWebSocket(ctx iris.Context) {
 	fmt.Printf("[WS] 断开连接: %s\n", sessionID)
 }
 
+// stop 停止当前流并等待完成
 func (s *StreamSession) stop() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.running {
-		close(s.stopChan)
-		s.stopChan = make(chan struct{})
-		s.running = false
+	if s.cancel != nil {
+		s.cancel()
+		s.cancel = nil
 	}
+	s.mu.Unlock()
+
+	// 等待流完成
+	s.wg.Wait()
 }
 
+// startStream 启动新流
+func (s *StreamSession) startStream(channel int, timestamp int64, speed float64) {
+	// 创建新的 context 和 streamID
+	ctx, cancel := context.WithCancel(context.Background())
+	newStreamID := atomic.AddUint64(&streamCounter, 1)
+
+	s.mu.Lock()
+	s.cancel = cancel
+	s.streamID = newStreamID
+	s.mu.Unlock()
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.streamVideoWithAudio(ctx, newStreamID, channel, timestamp, speed)
+	}()
+}
+
+// sendJSON 发送 JSON 消息（带 streamID 验证）
 func (s *StreamSession) sendJSON(v interface{}) error {
+	jsonData, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.ws.WriteJSON(v)
+	return s.ws.WriteMessage(websocket.TextMessage, jsonData)
 }
 
-func (s *StreamSession) sendBytes(data []byte) error {
+// sendBytesWithID 发送二进制数据（带 streamID 验证，如果 ID 不匹配则跳过）
+func (s *StreamSession) sendBytesWithID(streamID uint64, data []byte) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.ws.WriteMessage(websocket.BinaryMessage, data)
+
+	// 验证 streamID，如果不匹配说明已被新流替代
+	if s.streamID != streamID {
+		return false
+	}
+
+	s.ws.WriteMessage(websocket.BinaryMessage, data)
+	return true
 }
 
-// streamVideo 流式传输视频（无音频）
-func (s *StreamSession) streamVideo(channel int, startTimestamp int64, speed float64) {
-	s.mu.Lock()
-	s.running = true
-	stopChan := s.stopChan
-	s.mu.Unlock()
+// getDVR 获取当前 DVR（线程安全）
+func (s *StreamSession) getDVR() *DVRServer {
+	s.handlers.mu.RLock()
+	defer s.handlers.mu.RUnlock()
+	return s.handlers.dvr
+}
 
-	defer func() {
-		s.mu.Lock()
-		s.running = false
-		s.mu.Unlock()
-	}()
+// streamVideoWithAudio 流式传输音视频数据
+func (s *StreamSession) streamVideoWithAudio(ctx context.Context, streamID uint64, channel int, startTimestamp int64, speed float64) {
+	dvr := s.getDVR()
+	storage := dvr.GetStorage()
+	if storage == nil || !dvr.IsLoaded() {
+		s.sendJSON(map[string]interface{}{"error": "DVR 未加载"})
+		return
+	}
 
-	fmt.Printf("[Stream] 请求: ch=%d, ts=%d, speed=%.1f\n", channel, startTimestamp, speed)
-
-	// 查找录像
-	entry := s.findEntryForTime(startTimestamp, channel)
-	if entry == nil {
-		fmt.Printf("[Stream] 错误: 未找到指定时间的录像 (ts=%d, ch=%d)\n", startTimestamp, channel)
+	// 1. 查找段落
+	seg := storage.FindSegmentByTime(startTimestamp, channel, true)
+	if seg == nil {
 		s.sendJSON(map[string]interface{}{"error": "未找到指定时间的录像"})
 		return
 	}
-	fmt.Printf("[Stream] 找到录像: FileIndex=%d, RecFile=%s\n", entry.FileIndex, entry.RecFile)
 
-	records := s.dvr.GetFrameIndex(entry.FileIndex)
-	if records == nil {
-		fmt.Printf("[Stream] 错误: 帧索引不存在 (FileIndex=%d)\n", entry.FileIndex)
-		s.sendJSON(map[string]interface{}{"error": "帧索引不存在"})
-		return
-	}
-	fmt.Printf("[Stream] 帧索引: %d 条记录\n", len(records))
+	fileIndex := seg.FileIndex
+	fmt.Printf("[Stream#%d] file_index=%d, 时间范围: %d - %d\n", streamID, fileIndex, seg.StartTime, seg.EndTime)
 
-	// 筛选视频帧
-	var videoFrames []int
-	for i, r := range records {
-		if r.Channel == models.ChannelVideo1 || r.Channel == models.ChannelVideo2 {
-			videoFrames = append(videoFrames, i)
-		}
+	// 通道映射
+	frameChannel := seetong.ChannelVideo1
+	if channel == 2 {
+		frameChannel = seetong.ChannelVideo2
 	}
 
-	if len(videoFrames) == 0 {
-		s.sendJSON(map[string]interface{}{"error": "未找到视频帧"})
-		return
-	}
+	// 获取音频帧
+	audioFrames := storage.GetAudioFrames(fileIndex)
 
-	// 查找起始帧（I帧）
-	startIdx := 0
-	for i, idx := range videoFrames {
-		if records[idx].UnixTs >= uint32(startTimestamp) {
-			// 向前找 I 帧
-			for j := i; j >= 0; j-- {
-				if records[videoFrames[j]].FrameType == models.FrameTypeI {
-					startIdx = j
-					break
-				}
+	// 2. 使用音频帧时间戳找到目标时间对应的字节偏移
+	var targetOffset int64 = 0
+	if len(audioFrames) > 0 {
+		for _, af := range audioFrames {
+			if int64(af.UnixTs) >= startTimestamp {
+				targetOffset = int64(af.FileOffset)
+				break
 			}
-			break
+		}
+		if targetOffset == 0 {
+			targetOffset = int64(audioFrames[len(audioFrames)-1].FileOffset)
 		}
 	}
 
-	actualStartTime := int64(records[videoFrames[startIdx]].UnixTs)
-
-	// 发送 stream_start
-	s.sendJSON(map[string]interface{}{
-		"type":            "stream_start",
-		"channel":         channel,
-		"startTime":       entry.StartTime,
-		"endTime":         entry.EndTime,
-		"actualStartTime": actualStartTime,
-		"hasAudio":        false,
-	})
-
-	// 打开文件
-	f, err := os.Open(entry.RecFile)
-	if err != nil {
-		s.sendJSON(map[string]interface{}{"error": err.Error()})
-		return
-	}
-	defer f.Close()
-
-	frameInterval := time.Duration(float64(time.Second) / 25.0 / speed)
-	ticker := time.NewTicker(frameInterval)
-	defer ticker.Stop()
-
-	frameCount := 0
-	lastLogTime := time.Now()
-
-	for i := startIdx; i < len(videoFrames); i++ {
-		select {
-		case <-stopChan:
-			return
-		case <-ticker.C:
-		}
-
-		idx := videoFrames[i]
-		record := records[idx]
-
-		// 读取帧数据
-		data := make([]byte, record.FrameSize)
-		if _, err := f.ReadAt(data, int64(record.FileOffset)); err != nil {
-			continue
-		}
-
-		// 解析 NAL 单元并发送
-		nalUnits := parseNALUnits(data)
-		for _, nal := range nalUnits {
-			nalData := stripStartCode(data[nal.offset : nal.offset+nal.size])
-			s.sendVideoFrame(nalData, nal.nalType, int64(record.UnixTs)*1000)
-		}
-
-		frameCount++
-
-		// 日志
-		if time.Since(lastLogTime) >= time.Second {
-			fps := float64(frameCount) / time.Since(lastLogTime).Seconds()
-			fmt.Printf("[Stream] FPS: %.1f, 帧: %d/%d\n", fps, i, len(videoFrames))
-			frameCount = 0
-			lastLogTime = time.Now()
-		}
-	}
-
-	s.sendJSON(map[string]interface{}{"type": "stream_end"})
-}
-
-// streamVideoWithAudio 流式传输音视频
-func (s *StreamSession) streamVideoWithAudio(channel int, startTimestamp int64, speed float64) {
-	s.mu.Lock()
-	s.running = true
-	stopChan := s.stopChan
-	s.mu.Unlock()
-
-	defer func() {
-		s.mu.Lock()
-		s.running = false
-		s.mu.Unlock()
-	}()
-
-	fmt.Printf("[StreamAV] 请求: ch=%d, ts=%d, speed=%.1f\n", channel, startTimestamp, speed)
-
-	// 查找录像
-	entry := s.findEntryForTime(startTimestamp, channel)
-	if entry == nil {
-		fmt.Printf("[StreamAV] 错误: 未找到指定时间的录像 (ts=%d, ch=%d)\n", startTimestamp, channel)
-		s.sendJSON(map[string]interface{}{"error": "未找到指定时间的录像"})
-		return
-	}
-	fmt.Printf("[StreamAV] 找到录像: FileIndex=%d, RecFile=%s\n", entry.FileIndex, entry.RecFile)
-
-	records := s.dvr.GetFrameIndex(entry.FileIndex)
-	if records == nil {
-		fmt.Printf("[StreamAV] 错误: 帧索引不存在 (FileIndex=%d)\n", entry.FileIndex)
-		s.sendJSON(map[string]interface{}{"error": "帧索引不存在"})
-		return
-	}
-	fmt.Printf("[StreamAV] 帧索引: %d 条记录\n", len(records))
-
-	// 分离视频帧和音频帧
-	var videoFrames, audioFrames []int
-	for i, r := range records {
-		if r.Channel == models.ChannelVideo1 || r.Channel == models.ChannelVideo2 {
-			videoFrames = append(videoFrames, i)
-		} else if r.Channel == models.ChannelAudio {
-			audioFrames = append(audioFrames, i)
-		}
-	}
-
-	fmt.Printf("[StreamAV] 视频帧: %d, 音频帧: %d\n", len(videoFrames), len(audioFrames))
-
-	if len(videoFrames) == 0 {
-		s.sendJSON(map[string]interface{}{"error": "未找到视频帧"})
+	// 3. 搜索视频头
+	header := storage.ReadVideoHeader(fileIndex, targetOffset)
+	if header == nil {
+		s.sendJSON(map[string]interface{}{"type": "error", "message": "未找到视频头"})
 		return
 	}
 
-	// 查找起始帧（I帧）
-	startIdx := 0
-	for i, idx := range videoFrames {
-		if records[idx].UnixTs >= uint32(startTimestamp) {
-			for j := i; j >= 0; j-- {
-				if records[videoFrames[j]].FrameType == models.FrameTypeI {
-					startIdx = j
-					break
-				}
-			}
-			break
-		}
-	}
+	streamStartPos := header.StreamStartPos
+	fmt.Printf("[Stream#%d] VPS=%d, SPS=%d, PPS=%d, IDR=%d, pos=%d\n",
+		streamID, len(header.VPS), len(header.SPS), len(header.PPS), len(header.IDR), streamStartPos)
 
-	actualStartTime := int64(records[videoFrames[startIdx]].UnixTs)
-
-	// 发送 stream_start
-	s.sendJSON(map[string]interface{}{
-		"type":            "stream_start",
-		"channel":         channel,
-		"startTime":       entry.StartTime,
-		"endTime":         entry.EndTime,
-		"actualStartTime": actualStartTime,
-		"hasAudio":        len(audioFrames) > 0,
-		"audioFormat":     "g711-ulaw",
-		"audioSampleRate": 8000,
-	})
-
-	// 打开文件
-	f, err := os.Open(entry.RecFile)
-	if err != nil {
-		s.sendJSON(map[string]interface{}{"error": err.Error()})
-		return
-	}
-	defer f.Close()
-
-	// 发送视频头（VPS/SPS/PPS + 第一个 I 帧）
-	firstIFrameIdx := videoFrames[startIdx]
-	firstRecord := records[firstIFrameIdx]
-	headerData := make([]byte, min(512*1024, int(firstRecord.FrameSize)+100*1024))
-	f.ReadAt(headerData, int64(firstRecord.FileOffset))
-
-	nalUnits := parseNALUnits(headerData)
-	headerSent := false
-	var headerBytes []byte
-
-	fmt.Printf("[StreamAV] 首帧解析到 %d 个 NAL 单元\n", len(nalUnits))
-	for i, nal := range nalUnits {
-		fmt.Printf("[StreamAV]   NAL[%d]: type=%d, offset=%d, size=%d\n", i, nal.nalType, nal.offset, nal.size)
-		if i >= 10 {
-			fmt.Printf("[StreamAV]   ... 省略剩余 %d 个\n", len(nalUnits)-10)
-			break
-		}
-	}
-
-	for _, nal := range nalUnits {
-		if nal.nalType == NAL_VPS || nal.nalType == NAL_SPS || nal.nalType == NAL_PPS {
-			headerBytes = append(headerBytes, headerData[nal.offset:nal.offset+nal.size]...)
-			fmt.Printf("[StreamAV] 收集到 NAL type=%d, 累计 headerBytes=%d\n", nal.nalType, len(headerBytes))
-		} else if nal.nalType == NAL_IDR_W_RADL || nal.nalType == NAL_IDR_N_LP {
-			if len(headerBytes) > 0 {
-				headerNals := parseNALUnits(headerBytes)
-				fmt.Printf("[StreamAV] headerBytes 解析出 %d 个 NAL\n", len(headerNals))
-				for _, h := range headerNals {
-					nalData := stripStartCode(headerBytes[h.offset : h.offset+h.size])
-					fmt.Printf("[StreamAV] 发送 NAL type=%d, size=%d (去除start code后)\n", h.nalType, len(nalData))
-					s.sendVideoFrame(nalData, h.nalType, actualStartTime*1000)
-				}
-				fmt.Printf("[StreamAV] 已发送视频头，大小=%d 字节\n", len(headerBytes))
-			} else {
-				fmt.Printf("[StreamAV] 警告: 遇到 IDR 但没有收集到 VPS/SPS/PPS!\n")
-			}
-			idrData := stripStartCode(headerData[nal.offset : nal.offset+nal.size])
-			s.sendVideoFrame(idrData, nal.nalType, actualStartTime*1000)
-			fmt.Printf("[StreamAV] 已发送 IDR 帧，大小=%d 字节\n", len(idrData))
-			headerSent = true
-			break
-		}
-	}
-
-	if !headerSent && len(headerBytes) > 0 {
-		for _, h := range parseNALUnits(headerBytes) {
-			s.sendVideoFrame(stripStartCode(headerBytes[h.offset:h.offset+h.size]), h.nalType, actualStartTime*1000)
-		}
-	}
-
-	// 设置音频起始索引
-	audioIdx := 0
-	for i, idx := range audioFrames {
-		if records[idx].UnixTs >= uint32(actualStartTime) {
-			audioIdx = i
-			break
-		}
-	}
-
-	frameInterval := time.Duration(float64(time.Second) / 166.0 / speed)
-	ticker := time.NewTicker(frameInterval)
-	defer ticker.Stop()
-
-	frameCount := 0
-	lastLogTime := time.Now()
-	currentTimeMs := actualStartTime * 1000
-
-	for i := startIdx + 1; i < len(videoFrames); i++ {
-		select {
-		case <-stopChan:
-			return
-		case <-ticker.C:
-		}
-
-		vfIdx := videoFrames[i]
-		vf := records[vfIdx]
-
-		// 发送音频帧
-		for audioIdx < len(audioFrames) {
-			afIdx := audioFrames[audioIdx]
-			af := records[afIdx]
-			if int64(af.UnixTs)*1000 <= currentTimeMs {
-				audioData, _ := trec.ReadFrame(entry.RecFile, af.FileOffset, af.FrameSize)
-				if audioData != nil {
-					s.sendAudioFrame(audioData, int64(af.UnixTs)*1000)
-				}
-				audioIdx++
+	// 计算精确起始时间
+	var actualStartTime int64 = 0
+	if len(audioFrames) > 0 {
+		for _, af := range audioFrames {
+			if int64(af.FileOffset) <= streamStartPos {
+				actualStartTime = int64(af.UnixTs)
 			} else {
 				break
 			}
 		}
+	}
+	if actualStartTime == 0 {
+		actualStartTime = startTimestamp
+	}
 
-		// 发送视频帧
-		videoData, _ := trec.ReadFrame(entry.RecFile, vf.FileOffset, vf.FrameSize)
-		if videoData != nil {
-			nalUnits := parseNALUnits(videoData)
-			for _, nal := range nalUnits {
-				nalData := stripStartCode(videoData[nal.offset : nal.offset+nal.size])
-				s.sendVideoFrame(nalData, nal.nalType, int64(vf.UnixTs)*1000)
+	// 音频帧起始索引
+	audioIdx := 0
+	for i, af := range audioFrames {
+		if int64(af.FileOffset) >= streamStartPos {
+			audioIdx = i
+			break
+		}
+	}
+	fmt.Printf("[Stream#%d] 音频帧: %d, 起始索引: %d\n", streamID, len(audioFrames), audioIdx)
+
+	// 检查是否已取消
+	if ctx.Err() != nil {
+		fmt.Printf("[Stream#%d] 启动前已取消\n", streamID)
+		return
+	}
+
+	// 发送 stream_start
+	s.sendJSON(map[string]interface{}{
+		"type":            "stream_start",
+		"channel":         channel,
+		"startTime":       seg.StartTime,
+		"endTime":         seg.EndTime,
+		"actualStartTime": actualStartTime,
+		"hasAudio":        len(audioFrames) > 0,
+		"audioFormat":     "g711-ulaw",
+		"audioSampleRate": audioSampleRate,
+	})
+
+	// 4. 发送视频头
+	s.sendVideoFrameWithID(streamID, header.VPS, seetong.NalVPS, actualStartTime*1000)
+	s.sendVideoFrameWithID(streamID, header.SPS, seetong.NalSPS, actualStartTime*1000)
+	s.sendVideoFrameWithID(streamID, header.PPS, seetong.NalPPS, actualStartTime*1000)
+	s.sendVideoFrameWithID(streamID, header.IDR, seetong.NalIDRWRadl, actualStartTime*1000)
+
+	// 5. 创建流读取器
+	streamReader := storage.CreateStreamReader(fileIndex, streamStartPos, actualStartTime*1000, frameChannel)
+	if streamReader == nil {
+		s.sendJSON(map[string]interface{}{"type": "error", "message": "无法创建流读取器"})
+		return
+	}
+	defer streamReader.Close()
+
+	fps := 25.0 * speed
+	streamReader.SetFPS(fps)
+	frameInterval := time.Duration(float64(time.Second) / fps)
+
+	// 打开音频文件
+	recFile := storage.GetRecFile(fileIndex)
+	audioFile, err := os.Open(recFile)
+	if err != nil {
+		s.sendJSON(map[string]interface{}{"type": "error", "message": err.Error()})
+		return
+	}
+	defer audioFile.Close()
+
+	frameCount := 0
+	totalFramesSent := 0
+	lastLogTime := time.Now()
+
+	// 主循环
+	for {
+		// 检查取消信号
+		select {
+		case <-ctx.Done():
+			fmt.Printf("[Stream#%d] 已取消，发送了 %d 帧\n", streamID, totalFramesSent)
+			return
+		default:
+		}
+
+		// 读取 NAL 单元
+		nals := streamReader.ReadNextNals()
+		if len(nals) == 0 {
+			fmt.Printf("[Stream#%d] 文件结束, 总共发送 %d 帧\n", streamID, totalFramesSent)
+			break
+		}
+
+		for _, nal := range nals {
+			// 每个 NAL 前检查取消
+			if ctx.Err() != nil {
+				fmt.Printf("[Stream#%d] NAL 循环中取消\n", streamID)
+				return
+			}
+
+			if seetong.IsKeyframe(nal.NalType) {
+				fmt.Printf("[Stream#%d] IDR @ offset=%d\n", streamID, nal.FileOffset)
+			}
+
+			// 发送时验证 streamID
+			if !s.sendVideoFrameWithID(streamID, nal.Data, nal.NalType, nal.TimestampMs) {
+				fmt.Printf("[Stream#%d] 发送失败（ID 不匹配），退出\n", streamID)
+				return
+			}
+
+			if seetong.IsVideoFrame(nal.NalType) {
+				frameCount++
+				totalFramesSent++
+
+				// 发送音频帧
+				for audioIdx < len(audioFrames) {
+					af := audioFrames[audioIdx]
+					if int64(af.FileOffset) <= nal.FileOffset {
+						audioData := make([]byte, af.FrameSize)
+						audioFile.Seek(int64(af.FileOffset), 0)
+						audioFile.Read(audioData)
+
+						audioTsMs := int64(af.UnixTs) * 1000
+						if !s.sendAudioFrameWithID(streamID, audioData, audioTsMs) {
+							return
+						}
+						audioIdx++
+					} else {
+						break
+					}
+				}
+
+				// 使用可中断的 sleep
+				select {
+				case <-ctx.Done():
+					fmt.Printf("[Stream#%d] sleep 期间取消\n", streamID)
+					return
+				case <-time.After(frameInterval):
+				}
 			}
 		}
 
-		currentTimeMs = int64(vf.UnixTs) * 1000
-		frameCount++
-
-		if time.Since(lastLogTime) >= time.Second {
-			fps := float64(frameCount) / time.Since(lastLogTime).Seconds()
-			fmt.Printf("[StreamAV] FPS: %.1f, 视频帧: %d/%d, 音频帧: %d/%d\n",
-				fps, i, len(videoFrames), audioIdx, len(audioFrames))
+		now := time.Now()
+		if now.Sub(lastLogTime) >= time.Second {
+			actualFPS := float64(frameCount) / now.Sub(lastLogTime).Seconds()
+			fmt.Printf("[Stream#%d] FPS: %.1f, 音频: %d/%d, 总帧: %d\n",
+				streamID, actualFPS, audioIdx, len(audioFrames), totalFramesSent)
 			frameCount = 0
-			lastLogTime = time.Now()
+			lastLogTime = now
 		}
 	}
 
 	s.sendJSON(map[string]interface{}{"type": "stream_end"})
 }
 
-func (s *StreamSession) findEntryForTime(timestamp int64, channel int) *models.VPSCacheEntry {
-	entries := s.dvr.GetVPSCache()
-	fmt.Printf("[findEntry] VPSCache 条目数: %d, 查找: ts=%d, ch=%d\n", len(entries), timestamp, channel)
-
-	for i := range entries {
-		e := &entries[i]
-		if e.Channel == channel && e.StartTime <= timestamp && timestamp <= e.EndTime {
-			fmt.Printf("[findEntry] 找到匹配(精确通道): FileIndex=%d, ch=%d, start=%d, end=%d\n",
-				e.FileIndex, e.Channel, e.StartTime, e.EndTime)
-			return e
-		}
-	}
-	// 如果没找到指定通道，尝试任意通道
-	for i := range entries {
-		e := &entries[i]
-		if e.StartTime <= timestamp && timestamp <= e.EndTime {
-			fmt.Printf("[findEntry] 找到匹配(任意通道): FileIndex=%d, ch=%d, start=%d, end=%d\n",
-				e.FileIndex, e.Channel, e.StartTime, e.EndTime)
-			return e
-		}
-	}
-
-	// 打印前5个条目用于调试
-	fmt.Printf("[findEntry] 未找到匹配，打印前5个条目:\n")
-	for i := 0; i < len(entries) && i < 5; i++ {
-		e := &entries[i]
-		fmt.Printf("  [%d] ch=%d, start=%d, end=%d\n", e.FileIndex, e.Channel, e.StartTime, e.EndTime)
-	}
-
-	return nil
-}
-
-// sendVideoFrame 发送视频帧
-// 格式: Magic(4) + Timestamp(8) + FrameType(1) + DataLen(4) + Data
-func (s *StreamSession) sendVideoFrame(nalData []byte, nalType int, timestampMs int64) {
+// sendVideoFrameWithID 发送视频帧（带 ID 验证）
+func (s *StreamSession) sendVideoFrameWithID(streamID uint64, nalData []byte, nalType int, timestampMs int64) bool {
 	var frameType byte
 	switch nalType {
-	case NAL_VPS:
+	case seetong.NalVPS:
 		frameType = 2
-	case NAL_SPS:
+	case seetong.NalSPS:
 		frameType = 3
-	case NAL_PPS:
+	case seetong.NalPPS:
 		frameType = 4
-	case NAL_IDR_W_RADL, NAL_IDR_N_LP:
+	case seetong.NalIDRWRadl, seetong.NalIDRNLP:
 		frameType = 1
 	default:
 		frameType = 0
@@ -527,105 +400,16 @@ func (s *StreamSession) sendVideoFrame(nalData []byte, nalType int, timestampMs 
 	header[12] = frameType
 	binary.BigEndian.PutUint32(header[13:17], uint32(len(nalData)))
 
-	s.sendBytes(append(header, nalData...))
+	return s.sendBytesWithID(streamID, append(header, nalData...))
 }
 
-// sendAudioFrame 发送音频帧
-// 格式: Magic(4) + Timestamp(8) + SampleRate(2) + DataLen(4) + Data
-func (s *StreamSession) sendAudioFrame(audioData []byte, timestampMs int64) {
+// sendAudioFrameWithID 发送音频帧（带 ID 验证）
+func (s *StreamSession) sendAudioFrameWithID(streamID uint64, audioData []byte, timestampMs int64) bool {
 	header := make([]byte, 18)
 	copy(header[0:4], "G711")
 	binary.BigEndian.PutUint64(header[4:12], uint64(timestampMs))
-	binary.BigEndian.PutUint16(header[12:14], 8000)
+	binary.BigEndian.PutUint16(header[12:14], audioSampleRate)
 	binary.BigEndian.PutUint32(header[14:18], uint32(len(audioData)))
 
-	s.sendBytes(append(header, audioData...))
-}
-
-// NAL 类型常量
-const (
-	NAL_VPS        = 32
-	NAL_SPS        = 33
-	NAL_PPS        = 34
-	NAL_IDR_W_RADL = 19
-	NAL_IDR_N_LP   = 20
-	NAL_TRAIL_R    = 1
-	NAL_TRAIL_N    = 0
-)
-
-type nalUnit struct {
-	offset  int
-	size    int
-	nalType int
-}
-
-// parseNALUnits 解析 NAL 单元
-func parseNALUnits(data []byte) []nalUnit {
-	var units []nalUnit
-	startCode4 := []byte{0, 0, 0, 1}
-	startCode3 := []byte{0, 0, 1}
-
-	pos := 0
-	for pos < len(data)-4 {
-		var startLen int
-		if pos+4 <= len(data) && equal(data[pos:pos+4], startCode4) {
-			startLen = 4
-		} else if pos+3 <= len(data) && equal(data[pos:pos+3], startCode3) {
-			startLen = 3
-		} else {
-			pos++
-			continue
-		}
-
-		start := pos
-		nalBytePos := start + startLen
-		if nalBytePos >= len(data) {
-			break
-		}
-		nalType := (int(data[nalBytePos]) >> 1) & 0x3F
-
-		// 找下一个起始码
-		nextPos := pos + startLen
-		for nextPos < len(data)-4 {
-			if equal(data[nextPos:nextPos+4], startCode4) || equal(data[nextPos:nextPos+3], startCode3) {
-				break
-			}
-			nextPos++
-		}
-		if nextPos >= len(data)-4 {
-			nextPos = len(data)
-		}
-
-		units = append(units, nalUnit{
-			offset:  start,
-			size:    nextPos - start,
-			nalType: nalType,
-		})
-		pos = nextPos
-	}
-
-	return units
-}
-
-func equal(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// stripStartCode 去掉 NAL 起始码
-func stripStartCode(data []byte) []byte {
-	if len(data) >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1 {
-		return data[4:]
-	}
-	if len(data) >= 3 && data[0] == 0 && data[1] == 0 && data[2] == 1 {
-		return data[3:]
-	}
-	return data
+	return s.sendBytesWithID(streamID, append(header, audioData...))
 }
