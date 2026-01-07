@@ -4,34 +4,24 @@ import { TIMEZONES, type TimezoneValue } from '../stores/settings';
 interface SettingsPanelProps {
   timezone: TimezoneValue;
   storagePath: string;
-  timeOffset: number;
   onTimezoneChange: (timezone: TimezoneValue) => void;
   onStoragePathChange: (path: string) => void;
-  onTimeOffsetChange: (offset: number) => void;
 }
 
 export function SettingsPanel({
   timezone,
   storagePath,
-  timeOffset,
   onTimezoneChange,
   onStoragePathChange,
-  onTimeOffsetChange,
 }: SettingsPanelProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [pathInput, setPathInput] = useState(storagePath);
-  const [offsetInput, setOffsetInput] = useState(timeOffset.toString());
   const panelRef = useRef<HTMLDivElement>(null);
 
   // 同步外部路径变化
   useEffect(() => {
     setPathInput(storagePath);
   }, [storagePath]);
-
-  // 同步外部偏移变化
-  useEffect(() => {
-    setOffsetInput(timeOffset.toString());
-  }, [timeOffset]);
 
   // 点击外部关闭
   useEffect(() => {
@@ -56,30 +46,10 @@ export function SettingsPanel({
     }
   };
 
-  const handleOffsetSubmit = () => {
-    const newOffset = parseInt(offsetInput, 10);
-    if (!isNaN(newOffset) && newOffset !== timeOffset) {
-      onTimeOffsetChange(newOffset);
-    }
-  };
-
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter') {
       handlePathSubmit();
     }
-  };
-
-  const handleOffsetKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter') {
-      handleOffsetSubmit();
-    }
-  };
-
-  // 快捷调整按钮
-  const adjustOffset = (delta: number) => {
-    const newOffset = timeOffset + delta;
-    setOffsetInput(newOffset.toString());
-    onTimeOffsetChange(newOffset);
   };
 
   const currentTz = TIMEZONES.find(t => t.value === timezone);
@@ -161,52 +131,6 @@ export function SettingsPanel({
               </div>
               <p className="text-xs text-slate-500 mt-1">
                 修改后需要重新加载数据
-              </p>
-            </div>
-
-            {/* 时间偏移 */}
-            <div>
-              <label className="block text-xs text-slate-400 mb-1.5">时间偏移校正（秒）</label>
-              <div className="flex gap-2 items-center">
-                <button
-                  onClick={() => adjustOffset(-60)}
-                  className="px-2 py-1 bg-slate-700/50 hover:bg-slate-600/50 text-slate-300 rounded text-xs"
-                  title="-1分钟"
-                >
-                  -1m
-                </button>
-                <button
-                  onClick={() => adjustOffset(-10)}
-                  className="px-2 py-1 bg-slate-700/50 hover:bg-slate-600/50 text-slate-300 rounded text-xs"
-                  title="-10秒"
-                >
-                  -10s
-                </button>
-                <input
-                  type="number"
-                  value={offsetInput}
-                  onChange={(e) => setOffsetInput(e.target.value)}
-                  onKeyDown={handleOffsetKeyDown}
-                  onBlur={handleOffsetSubmit}
-                  className="w-20 bg-slate-900/50 border border-slate-600/50 rounded-lg px-2 py-1 text-sm text-slate-200 text-center focus:outline-none focus:ring-2 focus:ring-primary-500/50"
-                />
-                <button
-                  onClick={() => adjustOffset(10)}
-                  className="px-2 py-1 bg-slate-700/50 hover:bg-slate-600/50 text-slate-300 rounded text-xs"
-                  title="+10秒"
-                >
-                  +10s
-                </button>
-                <button
-                  onClick={() => adjustOffset(60)}
-                  className="px-2 py-1 bg-slate-700/50 hover:bg-slate-600/50 text-slate-300 rounded text-xs"
-                  title="+1分钟"
-                >
-                  +1m
-                </button>
-              </div>
-              <p className="text-xs text-slate-500 mt-1">
-                调整显示时间与视频水印的差异。正值使显示时间更晚。
               </p>
             </div>
           </div>

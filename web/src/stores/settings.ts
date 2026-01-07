@@ -23,7 +23,6 @@ export type TimezoneValue = typeof TIMEZONES[number]['value'];
 export interface Settings {
   timezone: TimezoneValue;
   storagePath: string;
-  timeOffset: number;  // 时间偏移（秒），用于校正显示时间与视频水印的差异
 }
 
 const STORAGE_KEY = 'dvr-settings';
@@ -32,7 +31,6 @@ const STORAGE_KEY = 'dvr-settings';
 const defaultSettings: Settings = {
   timezone: 'Asia/Shanghai',
   storagePath: '/Volumes/NO NAME',
-  timeOffset: 0,  // 默认无偏移
 };
 
 // 从 localStorage 加载设置

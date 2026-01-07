@@ -17,7 +17,6 @@ import {
   getRecordings,
   getStreamUrl,
   setTimezone,
-  setTimeOffset,
   type StreamCommand,
 } from './api';
 import {
@@ -58,7 +57,6 @@ function App() {
   // 设置状态
   const [timezone, setTimezoneState] = useState<TimezoneValue>(initialSettings.timezone);
   const [storagePath, setStoragePathState] = useState<string>(initialSettings.storagePath);
-  const [timeOffset, setTimeOffsetState] = useState<number>(initialSettings.timeOffset);
   const [pathHistory, setPathHistory] = useState<string[]>([]);
   const [showPathMenu, setShowPathMenu] = useState(false);
 
@@ -502,7 +500,7 @@ function App() {
       // 同步到服务器
       await setTimezone(newTimezone);
       setTimezoneState(newTimezone);
-      saveSettings({ timezone: newTimezone, storagePath, timeOffset });
+      saveSettings({ timezone: newTimezone, storagePath });
       addLog(`时区已更改为 ${newTimezone}`, 'success');
 
       // 重新加载录像日期（因为时区变化可能影响日期边界）
@@ -528,7 +526,7 @@ function App() {
   const handleStoragePathChange = useCallback(async (newPath: string) => {
     // 保存新路径到设置
     setStoragePathState(newPath);
-    saveSettings({ timezone, storagePath: newPath, timeOffset });
+    saveSettings({ timezone, storagePath: newPath });
 
     // 停止播放并发送暂停命令
     if (isPlaying) {
@@ -565,19 +563,7 @@ function App() {
     // 设置待加载路径并返回到设置向导页面
     setPendingStoragePath(newPath);
     setSetupComplete(false);
-  }, [timezone, timeOffset, isPlaying, sendCommand]);
-
-  const handleTimeOffsetChange = useCallback(async (newOffset: number) => {
-    addLog(`正在设置时间偏移到 ${newOffset}秒...`, 'info');
-    try {
-      await setTimeOffset(newOffset);
-      setTimeOffsetState(newOffset);
-      saveSettings({ timezone, storagePath, timeOffset: newOffset });
-      addLog(`时间偏移已设置为 ${newOffset}秒`, 'success');
-    } catch (error) {
-      addLog(`时间偏移设置失败: ${(error as Error).message}`, 'error');
-    }
-  }, [timezone, storagePath, addLog]);
+  }, [timezone, isPlaying, sendCommand]);
 
   // 键盘快捷键
   useEffect(() => {
@@ -732,10 +718,8 @@ function App() {
             <SettingsPanel
               timezone={timezone}
               storagePath={storagePath}
-              timeOffset={timeOffset}
               onTimezoneChange={handleTimezoneChange}
               onStoragePathChange={handleStoragePathChange}
-              onTimeOffsetChange={handleTimeOffsetChange}
             />
             <button
               className="p-2 hover:bg-slate-700/50 rounded-lg transition-colors text-slate-400"

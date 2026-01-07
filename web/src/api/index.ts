@@ -37,7 +37,6 @@ export interface ConfigResponse {
   storagePath: string;
   loaded: boolean;
   timezone?: string;
-  timeOffset?: number;
   entryCount?: number;
   fileCount?: number;
   cacheStatus?: CacheStatus;
@@ -85,25 +84,6 @@ export async function setTimezone(timezone: string): Promise<ConfigResponse> {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ timezone }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`API 错误: ${response.status}`);
-  }
-
-  return response.json();
-}
-
-/**
- * 设置时间偏移（秒）
- */
-export async function setTimeOffset(offset: number): Promise<ConfigResponse> {
-  const response = await fetch(`${API_BASE}/api/v1/config`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ timeOffset: offset }),
   });
 
   if (!response.ok) {
