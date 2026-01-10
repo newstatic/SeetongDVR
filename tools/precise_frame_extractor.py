@@ -284,7 +284,8 @@ if __name__ == "__main__":
     import random
 
     STORAGE_PATH = "/Volumes/NO NAME"
-    OUTPUT_DIR = "/Users/ttttt/PycharmProjects/SeetongDVR/precise_extract_test"
+    USERDIR = os.environ.get("USERDIR", os.path.expanduser("~"))
+    OUTPUT_DIR = os.path.join(USERDIR, "PycharmProjects/SeetongDVR/precise_extract_test")
 
     print("=" * 80)
     print("精确帧提取器测试")

@@ -13,9 +13,10 @@ import csv
 from PIL import Image
 
 # 路径配置
-SOURCE_DIR = "/Users/ttttt/PycharmProjects/SeetongDVR/osd_precise_test"
-OUTPUT_DIR = "/Users/ttttt/PycharmProjects/SeetongDVR/tesseract_train/ground-truth"
-INDEX_CSV = "/Users/ttttt/PycharmProjects/SeetongDVR/osd_precise_test/index_times.csv"
+USERDIR = os.environ.get("USERDIR", os.path.expanduser("~"))
+SOURCE_DIR = os.path.join(USERDIR, "PycharmProjects/SeetongDVR/osd_precise_test")
+OUTPUT_DIR = os.path.join(USERDIR, "PycharmProjects/SeetongDVR/tesseract_train/ground-truth")
+INDEX_CSV = os.path.join(USERDIR, "PycharmProjects/SeetongDVR/osd_precise_test/index_times.csv")
 
 
 def load_index_times():

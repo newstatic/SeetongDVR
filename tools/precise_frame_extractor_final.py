@@ -388,7 +388,8 @@ def test_final_extractor():
     import random
 
     STORAGE_PATH = "/Volumes/NO NAME"
-    OUTPUT_DIR = Path("/Users/ttttt/PycharmProjects/SeetongDVR/final_test")
+    USERDIR = os.environ.get("USERDIR", os.path.expanduser("~"))
+    OUTPUT_DIR = Path(USERDIR) / "PycharmProjects/SeetongDVR/final_test"
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     print("=" * 80)
